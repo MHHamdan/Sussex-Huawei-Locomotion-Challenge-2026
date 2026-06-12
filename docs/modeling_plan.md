@@ -60,22 +60,53 @@ Run is hardest to recall (rare + distinct). Metro is hardest to distinguish from
 
 **Goal:** end-to-end learnable baseline on raw windows.
 
-Architecture options:
-- 1-D CNN (simple, fast)
-- LSTM / GRU (captures sequential dependencies)
-- Temporal Convolutional Network (TCN)
+### Architecture — `src/featureflyers_shl/models/cnn1d.py`
 
-Inputs: (batch, 500, 9) float32 windows.
-Output: 8-class softmax head.
+| Block | Channels | Kernel | Pool | Output length |
+|-------|----------|--------|------|--------------|
+| Conv1 | 9 → 32   | 7      | /2   | 250           |
+| Conv2 | 32 → 64  | 5      | /2   | 125           |
+| Conv3 | 64 → 128 | 3      | /5   | 25            |
+| Conv4 | 128 → 256| 3      | —    | 25            |
+| GAP   |          |        |      | 1             |
+| Linear| 256 → 8 |        |      | —             |
 
-Training:
-- Adam, lr=1e-3, cosine decay
-- Batch size 512, 50 epochs
-- Class-weighted cross-entropy for imbalance
+Each block: Conv1d → BatchNorm1d → ReLU → (MaxPool) → Dropout
 
-Multi-position fusion:
+### Dataset — `src/featureflyers_shl/data/dataset.py`
+- `SHLWindowDataset(hdf5_path, split, position, sample_limit, seed)`
+- Train/val: stratified window sampling from flat `(N, 9)` streams
+- Test: direct access to pre-windowed `(92726, 500, 9)`
+- Returns `(x, y)` for train/val; `(x, idx)` for test
+- Labels converted to 0-based (HDF5 1-8 → 0-7)
+
+### Training — `scripts/train_deep.py`
+- AdamW + cosine LR decay, class-weighted cross-entropy
+- Saves `model.pt`, `config.json`, `metrics.json` to `outputs/deep_baseline/<run>/`
+
+```bash
+# Smoke test (Bag, 5000 windows, 2 epochs)
+python scripts/train_deep.py \
+    --position Bag --sample-limit 5000 --epochs 2 \
+    --batch-size 128 --device auto
+
+# Full Bag-position training
+python scripts/train_deep.py \
+    --position Bag --epochs 50 --batch-size 512 --device auto
+```
+
+Outputs saved to `outputs/deep_baseline/<run_name>/`.
+
+### Results
+
+| Mode | Macro-F1 | Accuracy | Notes |
+|------|----------|---------|-------|
+| Bag, 5000 windows, 2 ep (smoke) | TBD | TBD | |
+| Bag, full dataset, 50 ep | TBD | TBD | |
+
+Multi-position fusion (planned):
 - Late fusion: average softmax logits across available positions
-- Early fusion: concatenate windows → (batch, 500, 36)
+- Early fusion: concatenate windows → `(batch, 36, 500)`
 
 ---
 
