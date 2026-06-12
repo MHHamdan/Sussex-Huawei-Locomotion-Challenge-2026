@@ -82,10 +82,10 @@ Multi-position fusion:
 
 | Model | Type | Input format | Notes |
 |-------|------|-------------|-------|
-| [MOMENT](https://github.com/moment-research/MOMENT) | Transformer | (batch, T, C) patches | Time-series BERT |
-| [Moirai](https://github.com/SalesforceAIResearch/uni2ts) | Transformer | multi-variate TS | Salesforce, MIT license |
-| [TimesFM](https://github.com/google-research/timesfm) | Transformer | univariate TS | Google, Apache-2 |
-| [TimeSformer](https://github.com/facebookresearch/TimeSformer) | Video Transformer | adaptable | needs reshape |
+| [MOMENT](https://github.com/moment-timeseries-foundation-model/moment) | Transformer | `(batch, T, C)` patches | Time-series foundation model / Time-series BERT-style |
+| [Moirai](https://github.com/SalesforceAIResearch/uni2ts) | Transformer | Multivariate time series | Salesforce Uni2TS; includes Moirai models |
+| [TimesFM](https://github.com/google-research/timesfm) | Transformer | Univariate time series | Google Research; Apache-2.0 |
+| [TimeSformer](https://github.com/facebookresearch/TimeSformer) | Video Transformer | Video frames / adaptable | Can be adapted by reshaping sensor windows, but repo is archived |
 
 ### Protocol (all models)
 1. Freeze all foundation model parameters (`requires_grad = False`).
