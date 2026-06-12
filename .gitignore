@@ -1,0 +1,114 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test / lint
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Dataset — raw and processed data must not be committed
+dataset/raw/
+dataset/processed/
+dataset/archives/
+*.hdf5
+*.h5
+
+# Model checkpoints and outputs
+outputs/
+!outputs/.gitkeep
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local AI files (also excluded via .git/info/exclude)
+AGENTS.md
+CLAUDE.md
+
+# ============================================================
+# SHL Challenge local data - DO NOT COMMIT
+# ============================================================
+
+# Raw/extracted dataset
+dataset/raw/
+dataset/archives/
+dataset/processed/
+
+# Large dataset/archive files
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+
+# Processed sensor files
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.parquet
+*.pkl
+*.pickle
+
+# Model/checkpoint artifacts
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.joblib
+
+# Experiment outputs
+outputs/*
+!outputs/.gitkeep
+runs/
+logs/
+*.log
+
+# Notebook temporary files
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Keep dataset documentation only
+!dataset/README.md
+
+# Local AI assistant instructions
+AGENTS.md
+CLAUDE.md
