@@ -13,41 +13,46 @@ Foundation models must remain **frozen**. Only lightweight heads may be trained.
 
 - [x] Unzip raw data → `dataset/raw/`
 - [x] Convert to HDF5 → `dataset/processed/shl2026.hdf5`
-- [ ] Label distribution plots per split and position
-- [ ] Signal visualisation: 10-second windows per class per sensor
-- [ ] Sample-rate verification (expected ~100 Hz after windowing)
-- [ ] Check class imbalance across positions
-- [ ] Define window size and hop: 500 samples @ 500 Hz = 1 s windows
+  - Train/val: flat `(N, 9)` per position; test: pre-windowed `(92726, 500, 9)`
+- [x] Label distribution analysis → `outputs/eda/label_analysis.txt`
+- [x] Class imbalance noted: Run=4.3 %, Bus=14.4 % in train
+- [x] Window size fixed: 500 samples, hop 250 (50 % overlap)
+- [ ] Signal visualisation per class (deferred to notebook)
 
 ---
 
-## Stage 2 — Classical ML Baseline
+## Stage 2 — Classical ML Baseline ✓
 
 **Goal:** establish a reproducible floor before any deep learning.
 
-### Feature extraction (per window, per sensor axis)
+### Feature extraction — implemented in `src/featureflyers_shl/features/statistical.py`
 
-Statistical:
-- mean, std, min, max, range
-- RMS, zero-crossing rate
-- skewness, kurtosis
+| Group | Features | Count |
+|-------|----------|-------|
+| Per-axis statistics | mean, std, min, max, median, energy, zcr | 9 × 7 = 63 |
+| Group magnitude stats | mean, std, min, max, energy for Acc/Gyr/Mag magnitudes | 3 × 5 = 15 |
+| Per-axis spectral | top-20 FFT magnitudes + energy + entropy + rolloff | 9 × 23 = 207 |
+| Group magnitude FFT | same spectral set on Acc/Gyr/Mag magnitudes | 3 × 23 = 69 |
+| **Total** | | **354** |
 
-Spectral (FFT):
-- Top-K dominant frequencies and their magnitudes
-- Spectral energy, spectral entropy, spectral rolloff
+### Classifiers — implemented in `scripts/train_baseline.py`
+- [x] Random Forest (class_weight=balanced, n_estimators=100)
+- [x] Logistic Regression (class_weight=balanced)
+- [x] Single-position mode (default: Bag)
+- [x] Multi-position early fusion (`--fusion early`)
 
-Cross-axis:
-- Correlation coefficients between Acc_x/y/z
-- Magnitude: sqrt(x²+y²+z²) for Acc, Gyr, Mag
+### Submission — implemented in `scripts/generate_submission.py`
+- [x] Load model.joblib → predict on test → write 92 726 × 500 submission file
 
-### Classifiers
-1. Random Forest (RF) — strong baseline, interpretable feature importances
-2. Support Vector Machine (linear kernel, scaled features)
+### Results (5 000 stratified windows, Bag, RF, seed=42)
 
-### Evaluation
-- 5-fold cross-validation on training set
-- Hold-out validation set for threshold tuning
-- Report macro-F1, per-class F1, confusion matrix
+| Mode | Macro-F1 | Accuracy |
+|------|----------|---------|
+| Single position (Bag) | ~0.57 | ~0.57 |
+| 4-position early fusion | TBD | TBD |
+| Full dataset | TBD | TBD |
+
+Run is hardest to recall (rare + distinct). Metro is hardest to distinguish from Train.
 
 ---
 
