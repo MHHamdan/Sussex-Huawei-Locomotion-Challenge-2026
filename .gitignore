@@ -88,7 +88,7 @@ dataset/processed/
 
 # Model/checkpoint artifacts
 checkpoints/
-models/
+/models/
 *.pt
 *.pth
 *.ckpt
