@@ -121,10 +121,45 @@ pip install -e .
 ### 3. Prepare the dataset
 
 ```bash
-python scripts/prepare_dataset.py
-python scripts/inspect_dataset.py
-python scripts/convert_to_hdf5.py
+python scripts/prepare_dataset.py          # extract zips → dataset/raw/
+python scripts/inspect_dataset.py          # verify structure
+python scripts/convert_to_hdf5.py          # convert → dataset/processed/shl2026.hdf5
 ```
+
+### 4. Validate the HDF5 file
+
+```bash
+python scripts/validate_hdf5.py
+```
+
+### 5. Explore label distributions
+
+```bash
+python scripts/analyze_labels.py           # saves outputs/eda/label_analysis.txt
+```
+
+### 6. Train the baseline
+
+```bash
+# Fast mode — 5 000 windows, Bag position, Random Forest
+python scripts/train_baseline.py --sample-limit 5000
+
+# Single position, full training data
+python scripts/train_baseline.py --positions Bag --model rf
+
+# All 4 positions, full data (slow, ~1 h on CPU)
+python scripts/train_baseline.py --positions Bag Hand Hips Torso --model rf
+```
+
+Results land in `outputs/baseline/<run-name>/metrics.json`.
+
+---
+
+## Dataset structure notes
+
+- **Train / Validation**: stored flat as `(N, 9)` float32 in HDF5; windowed on the fly.
+- **Test**: stored pre-windowed as `(92 726, 500, 9)` float32 — 92 726 windows × 500 samples × 9 sensors.
+- **Submission format**: 92 726 lines × 500 comma-separated integer predictions per line = 46 363 000 per-sample labels.
 
 ---
 

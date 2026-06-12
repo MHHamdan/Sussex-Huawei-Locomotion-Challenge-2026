@@ -55,8 +55,11 @@ def read_txt_tokens(path: Path, dtype) -> np.ndarray:
 
 
 def load_sensor_file(path: Path, dtype=np.float32) -> np.ndarray:
-    """Memory-efficient load of a single sensor txt file → 1-D array."""
-    tokens = path.read_text().split()
+    """Load a sensor txt file → 1-D array. Handles both space- and comma-delimited files."""
+    text = path.read_text()
+    # Detect delimiter: comma-separated (test split) vs space-separated (train/val)
+    sep = "," if "," in text[:200] else None
+    tokens = text.replace(",", " ").split() if sep else text.split()
     return np.array(tokens, dtype=dtype)
 
 
