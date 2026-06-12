@@ -1,7 +1,7 @@
 # Sussex-Huawei Locomotion Challenge 2026 — FeatureFlyers
 
 Repository for developing the **FeatureFlyers** team pipeline for the
-[Sussex-Huawei Locomotion Challenge 2026](http://www.shl-dataset.org/activity-recognition-challenge/).
+[Sussex-Huawei Locomotion Challenge 2026]([http://www.shl-dataset.org/activity-recognition-challenge/](http://www.shl-dataset.org/challenge-2026/)).
 
 ---
 
