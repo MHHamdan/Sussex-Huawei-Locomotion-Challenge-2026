@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 HDF5_PATH = REPO_ROOT / "dataset" / "processed" / "shl2026.hdf5"
-OUT_DIR = REPO_ROOT / "outputs" / "baseline"
+OUT_DIR = REPO_ROOT / "outputs" / "execution-output"
 
 LABEL_MAP = {1: "Still", 2: "Walking", 3: "Run", 4: "Bike",
              5: "Car", 6: "Bus", 7: "Train", 8: "Metro"}
@@ -239,13 +239,21 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sample-limit", type=int, default=None,
                         help="Max windows per split (stratified; None = full dataset)")
-    parser.add_argument("--model", choices=["rf", "lr"], default="rf")
+    parser.add_argument("--model", choices=["rf", "lr", "xgb"], default="rf")
     parser.add_argument("--positions", nargs="+", default=["Bag"],
                         choices=POSITIONS)
     parser.add_argument("--fusion", choices=["none", "early"], default="none",
                         help="none=single position; early=concatenate features")
     parser.add_argument("--n-estimators", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda",
+                        help="cpu | cuda  (used by xgb only; default: cuda)")
+    parser.add_argument("--early-stopping-rounds", type=int, default=30,
+                        help="XGBoost early stopping rounds (0 = disabled)")
+    parser.add_argument("--cache-dir", type=Path,
+                        default=Path(__file__).resolve().parent.parent
+                        / "dataset" / "processed" / "features",
+                        help="Pre-computed feature cache dir (from precompute_features.py)")
     args = parser.parse_args()
 
     if args.fusion == "early" and len(args.positions) < 2:
@@ -264,6 +272,13 @@ def main() -> None:
         print(f"ERROR: {e}\nRun: pip install scikit-learn h5py joblib")
         sys.exit(1)
 
+    if args.model == "xgb":
+        try:
+            import xgboost as xgb  # noqa: F401
+        except ImportError:
+            print("ERROR: xgboost not installed — run: pip install xgboost")
+            sys.exit(1)
+
     if not HDF5_PATH.exists():
         print(f"ERROR: {HDF5_PATH} not found. Run scripts/convert_to_hdf5.py first.")
         sys.exit(1)
@@ -274,23 +289,68 @@ def main() -> None:
     run_dir = OUT_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    xgb_device = None
+    if args.model == "xgb":
+        import torch
+        if args.device == "auto":
+            xgb_device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            xgb_device = args.device
+
     print(f"\nBaseline — model={args.model}  fusion={args.fusion}"
           f"  positions={args.positions}"
-          f"  sample_limit={args.sample_limit}  seed={args.seed}")
+          f"  sample_limit={args.sample_limit}  seed={args.seed}"
+          + (f"  device={xgb_device}" if xgb_device else ""))
     print(f"Output → {run_dir.relative_to(REPO_ROOT)}\n")
 
     t_start = time.time()
 
-    with h5py.File(HDF5_PATH, "r") as hf:
-        print("Loading TRAIN …")
-        X_train, y_train = load_features(
-            hf, "train", args.positions, args.sample_limit, rng, args.fusion)
-        print(f"  X_train {X_train.shape}  y_train {y_train.shape}\n")
+    def _load_split(split: str, rng_: np.random.Generator):
+        """Load features from cache if available, else extract from HDF5."""
+        positions = args.positions if args.fusion == "early" else [args.positions[0]]
+        cache_files = [args.cache_dir / f"{split}_{pos}.npz" for pos in positions]
+        use_cache = all(cf.exists() for cf in cache_files)
 
-        print("Loading VALIDATION …")
-        X_val, y_val = load_features(
-            hf, "validation", args.positions, args.sample_limit, rng, args.fusion)
-        print(f"  X_val {X_val.shape}  y_val {y_val.shape}\n")
+        if use_cache:
+            print(f"  [CACHE] loading {split} from {len(cache_files)} cached file(s) ...",
+                  flush=True)
+            t0 = time.time()
+            X_parts, y_ref = [], None
+            for cf in cache_files:
+                d = np.load(cf)
+                X_parts.append(d["X"])
+                if y_ref is None:
+                    y_ref = d["y"]   # 1-based labels
+            X_full = np.concatenate(X_parts, axis=1)
+            if args.sample_limit is not None:
+                classes = np.unique(y_ref)
+                k_per   = max(1, args.sample_limit // len(classes))
+                sel = np.concatenate([
+                    rng_.choice(np.where(y_ref == cls)[0],
+                                size=min(k_per, int((y_ref == cls).sum())),
+                                replace=False)
+                    for cls in classes
+                ])[:args.sample_limit]
+                X_full, y_ref = X_full[sel], y_ref[sel]
+            print(f"    {X_full.shape}  ({time.time()-t0:.1f}s)\n")
+            return X_full, y_ref
+
+        # No cache — fall back to HDF5 extraction
+        print(f"  [HDF5] extracting {split} features (run precompute_features.py to cache) ...",
+              flush=True)
+        with h5py.File(HDF5_PATH, "r") as hf:
+            X, y = load_features(hf, split, args.positions, args.sample_limit,
+                                 rng_, args.fusion)
+        print(f"    {X.shape}\n")
+        return X, y
+
+    print("Loading TRAIN …")
+    X_train, y_train = _load_split("train", rng)
+    print(f"  X_train {X_train.shape}  y_train {y_train.shape}\n")
+
+    print("Loading VALIDATION …")
+    X_val, y_val = _load_split("validation", rng)
+    print(f"  X_val {X_val.shape}  y_val {y_val.shape}\n")
 
     # NaN guard
     for name, X in [("train", X_train), ("val", X_val)]:
@@ -309,6 +369,27 @@ def main() -> None:
         clf = RandomForestClassifier(
             n_estimators=args.n_estimators, n_jobs=-1,
             random_state=args.seed, class_weight="balanced")
+    elif args.model == "xgb":
+        import xgboost as xgb
+        from sklearn.utils.class_weight import compute_sample_weight
+        # Remap labels from raw HDF5 (1-8) to 0-based for XGBoost
+        y_train = y_train.astype(np.int64) - 1
+        y_val   = y_val.astype(np.int64) - 1
+        n_cls   = len(np.unique(y_train))
+        esr = args.early_stopping_rounds if args.early_stopping_rounds > 0 else None
+        clf = xgb.XGBClassifier(
+            n_estimators=args.n_estimators,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="mlogloss",
+            num_class=n_cls,
+            early_stopping_rounds=esr,
+            device=xgb_device,
+            random_state=args.seed,
+            n_jobs=-1,
+        )
     else:
         clf = LogisticRegression(
             max_iter=500, n_jobs=-1,
@@ -316,7 +397,17 @@ def main() -> None:
 
     print(f"Fitting {clf.__class__.__name__} …", flush=True)
     t_fit = time.time()
-    clf.fit(X_train_s, y_train)
+    if args.model == "xgb":
+        sample_weights = compute_sample_weight("balanced", y_train)
+        fit_kwargs = dict(sample_weight=sample_weights)
+        if esr is not None:
+            fit_kwargs["eval_set"] = [(X_val_s, y_val)]
+            fit_kwargs["verbose"] = 50
+        clf.fit(X_train_s, y_train, **fit_kwargs)
+        if esr is not None:
+            print(f"  Best iteration: {clf.best_iteration}")
+    else:
+        clf.fit(X_train_s, y_train)
     print(f"  Done in {time.time()-t_fit:.1f}s\n")
 
     # Evaluate
@@ -325,10 +416,12 @@ def main() -> None:
     acc = float((y_pred == y_val).mean())
 
     present = sorted(set(y_train.tolist()) | set(y_val.tolist()))
+    # XGBoost uses 0-based labels; RF/LR use raw 1-based HDF5 labels
+    lmap_offset = 1 if args.model == "xgb" else 0
     report = classification_report(
         y_val, y_pred,
         labels=present,
-        target_names=[LABEL_MAP[l] for l in present],
+        target_names=[LABEL_MAP[l + lmap_offset] for l in present],
         zero_division=0,
     )
     print(f"{'='*60}")

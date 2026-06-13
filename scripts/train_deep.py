@@ -13,7 +13,7 @@ python scripts/train_deep.py --position Bag --epochs 50 --batch-size 512 --devic
 # Four-position early-fusion (concatenate windows along channel dim) — planned Stage 4
 python scripts/train_deep.py --position Bag Hand Hips Torso --epochs 50 --device auto
 
-Outputs saved to:  outputs/deep_baseline/<run_name>/
+Outputs saved to:  outputs/execution-output/<run_name>/
   model.pt     — model state dict
   config.json  — all hyperparameters
   metrics.json — per-epoch and final validation metrics
@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 HDF5_PATH    = REPO_ROOT / "dataset" / "processed" / "shl2026.hdf5"
-DEFAULT_OUTD = REPO_ROOT / "outputs" / "deep_baseline"
+DEFAULT_OUTD = REPO_ROOT / "outputs" / "execution-output"
 
 LABEL_MAP = {0:"Still",1:"Walking",2:"Run",3:"Bike",
              4:"Car",5:"Bus",6:"Train",7:"Metro"}
@@ -105,11 +105,14 @@ def main() -> None:
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--dropout",      type=float, default=0.3)
     parser.add_argument("--seed",         type=int,   default=42)
-    parser.add_argument("--device",       default="auto",
-                        help="auto | cpu | cuda | cuda:0 …")
+    parser.add_argument("--device",       default="cuda",
+                        help="cpu | cuda | cuda:0 … (default: cuda)")
     parser.add_argument("--num-workers",  type=int,   default=0,
                         help="DataLoader workers (0 = main process, safest for HDF5)")
     parser.add_argument("--output-dir",   type=Path,  default=DEFAULT_OUTD)
+    parser.add_argument("--patience",     type=int,   default=0,
+                        help="Early-stopping patience (epochs without val macro-F1 improvement). "
+                             "0 = disabled.")
     args = parser.parse_args()
 
     # ---- imports (fail early with helpful messages) ----
@@ -192,7 +195,12 @@ def main() -> None:
     # ---- model ----
     model = CNN1D(n_channels=9, n_classes=N_CLASSES, dropout=args.dropout).to(device)
     n_params = CNN1D.n_params(model)
-    print(f"\nModel   : CNN1D  params={n_params:,}")
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if n_gpus > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"\nModel   : CNN1D  params={n_params:,}  (DataParallel x{n_gpus} GPUs)")
+    else:
+        print(f"\nModel   : CNN1D  params={n_params:,}")
 
     criterion  = nn.CrossEntropyLoss(weight=weights)
     optimizer  = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -209,6 +217,7 @@ def main() -> None:
     history: list[dict] = []
     best_f1 = 0.0
     best_state = None
+    no_improve = 0
     t_train = time.time()
 
     for epoch in range(1, args.epochs + 1):
@@ -232,13 +241,22 @@ def main() -> None:
 
         if val_f1 >= best_f1:
             best_f1    = val_f1
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            _m = model.module if hasattr(model, "module") else model
+            best_state = {k: v.cpu().clone() for k, v in _m.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if args.patience > 0 and no_improve >= args.patience:
+            print(f"\nEarly stopping: no improvement for {args.patience} epochs.")
+            break
 
     total_time = time.time() - t_train
     print(f"\nTraining done in {total_time:.1f}s   best val macro-F1 = {best_f1:.4f}")
 
     # ---- final eval on best model ----
-    model.load_state_dict(best_state)
+    _m = model.module if hasattr(model, "module") else model
+    _m.load_state_dict(best_state)
     final_acc, final_f1, final_preds, final_labels = eval_epoch(model, val_loader, device)
     present = sorted(set(final_labels.tolist()))
     report  = classification_report(
@@ -251,13 +269,28 @@ def main() -> None:
     print(f"{'='*60}")
     print(report)
 
+    # ---- confusion matrix (text) ----
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(final_labels, final_preds,
+                          labels=list(range(N_CLASSES)))
+    present_names = [LABEL_MAP[i] for i in range(N_CLASSES)]
+    header = "Pred ->  " + "  ".join(f"{n:>8}" for n in present_names)
+    cm_lines = [header]
+    for i, row in enumerate(cm):
+        row_str = f"{present_names[i]:>8} | " + "  ".join(f"{v:>8d}" for v in row)
+        cm_lines.append(row_str)
+    cm_text = "\n".join(cm_lines)
+    print("\nConfusion matrix (rows=true, cols=pred):")
+    print(cm_text)
+    (run_dir / "confusion_matrix.txt").write_text(cm_text)
+
     # ---- save artefacts ----
     torch.save(best_state, run_dir / "model.pt")
 
     config = dict(
         model="CNN1D", position=args.position, sample_limit=args.sample_limit,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
-        dropout=args.dropout, seed=args.seed,
+        dropout=args.dropout, seed=args.seed, patience=args.patience,
         device=str(device), amp=use_amp, n_params=n_params,
         n_train=len(ds_train), n_val=len(ds_val),
     )
@@ -267,13 +300,15 @@ def main() -> None:
         best_val_macro_f1=round(final_f1, 4),
         best_val_accuracy=round(final_acc, 4),
         total_time_s=round(total_time, 1),
+        epochs_trained=len(history),
+        early_stopped=(args.patience > 0 and no_improve >= args.patience),
         history=history,
     )
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (run_dir / "classification_report.txt").write_text(report)
 
     print(f"\nSaved → {run_dir.relative_to(REPO_ROOT)}/")
-    print(f"  model.pt  config.json  metrics.json  classification_report.txt")
+    print(f"  model.pt  config.json  metrics.json  classification_report.txt  confusion_matrix.txt")
 
 
 if __name__ == "__main__":

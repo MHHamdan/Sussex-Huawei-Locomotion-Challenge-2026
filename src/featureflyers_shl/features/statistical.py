@@ -139,6 +139,9 @@ def extract(window: np.ndarray, fft_top_k: int = _DEFAULT_FFT_K) -> np.ndarray:
     """
     if window.ndim != 2 or window.shape[1] != 9:
         raise ValueError(f"Expected (W, 9), got {window.shape}")
+    # Guard against NaN/Inf from recording gaps in raw sensor data
+    if not np.isfinite(window).all():
+        window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
 
     parts = [
         _stat_per_axis(window),

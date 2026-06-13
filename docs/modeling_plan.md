@@ -44,15 +44,40 @@ Foundation models must remain **frozen**. Only lightweight heads may be trained.
 ### Submission — implemented in `scripts/generate_submission.py`
 - [x] Load model.joblib → predict on test → write 92 726 × 500 submission file
 
-### Results (5 000 stratified windows, Bag, RF, seed=42)
+### Infrastructure improvements
+- [x] `scripts/precompute_features.py` — pre-computes all 354 features for every position/split using 32 parallel CPU workers, saves to `dataset/processed/features/*.npz` (2.4 GB total). Cuts data loading from ~130s to ~1s per run.
+- [x] XGBoost GPU (`--model xgb --device cuda`) — replaces CPU-only Random Forest for faster fitting
+- [x] Balanced sample weights for XGBoost — `compute_sample_weight("balanced")` fixes class imbalance on full dataset
+- [x] Early stopping for XGBoost — `--early-stopping-rounds 30` prevents overfitting and saves training time
+- [x] NaN guard in `statistical.py:extract()` — handles recording gaps (2 windows in train/Hips had NaN raw sensor values)
 
-| Mode | Macro-F1 | Accuracy |
-|------|----------|---------|
-| Single position (Bag) | ~0.57 | ~0.57 |
-| 4-position early fusion | TBD | TBD |
-| Full dataset | TBD | TBD |
+### Results — all runs, Bag position, seed=42, full validation set (57 576 windows)
 
-Run is hardest to recall (rare + distinct). Metro is hardest to distinguish from Train.
+| Model | Positions | Sample Limit | Macro-F1 | Accuracy | Runtime | Notes |
+|-------|-----------|-------------|---------|---------|---------|-------|
+| RF | Bag | 20 000 | 0.6427 | 63.4% | 121s | sklearn, CPU, class_weight=balanced |
+| XGBoost | Bag | 20 000 | 0.6605 | 64.7% | 126s | GPU, no sample weights |
+| XGBoost v1 | Bag | full | 0.6039 | 59.6% | 1303s | GPU, no sample weights — class imbalance hurt |
+| XGBoost v2 | Bag | full | 0.6384 | 62.9% | 1176s | GPU, balanced weights + early stop |
+| **XGBoost** | **Bag+Hand+Hips+Torso** | **full** | **0.6613** | **67.8%** | **86s** | GPU, 4-pos early fusion, cached features |
+
+Best per-class F1 (4-position early fusion):
+
+| Class | F1 | Notes |
+|-------|----|-------|
+| Still | 0.86 | strong |
+| Walking | 0.89 | strong |
+| Run | 0.66 | rare class (1 110 val windows) |
+| Bike | 0.87 | strong |
+| Car | 0.72 | moderate |
+| Bus | 0.48 | hard — confused with Train |
+| Train | 0.50 | hard — confused with Metro/Bus |
+| Metro | 0.30 | hardest — underground vibration similar to Train |
+
+Key findings:
+- 4-position fusion adds +2.3pp macro-F1 over single-position (0.6613 vs 0.6384)
+- Cache reduces total pipeline time from ~20 min to ~90s for a full-dataset run
+- Train/Metro remain the hardest pair — need deeper model or foundation model embeddings
 
 ---
 
@@ -82,27 +107,43 @@ Each block: Conv1d → BatchNorm1d → ReLU → (MaxPool) → Dropout
 
 ### Training — `scripts/train_deep.py`
 - AdamW + cosine LR decay, class-weighted cross-entropy
-- Saves `model.pt`, `config.json`, `metrics.json` to `outputs/deep_baseline/<run>/`
+- Early stopping via `--patience` (0 = disabled)
+- Best model saved by val macro-F1
+- Saves `model.pt`, `config.json`, `metrics.json`, `classification_report.txt`, `confusion_matrix.txt` to `outputs/deep_baseline/<run>/`
+
+Multi-GPU support via `torch.nn.DataParallel` — automatically uses all 4 RTX 2080 Ti when `--device cuda` is set.
 
 ```bash
 # Smoke test (Bag, 5000 windows, 2 epochs)
 python scripts/train_deep.py \
     --position Bag --sample-limit 5000 --epochs 2 \
-    --batch-size 128 --device auto
+    --batch-size 128 --device cuda
 
-# Full Bag-position training
+# Stage 3 experiment run
 python scripts/train_deep.py \
-    --position Bag --epochs 50 --batch-size 512 --device auto
+    --position Bag --sample-limit 20000 --epochs 10 \
+    --batch-size 128 --patience 4 --device cuda
+
+# Full Bag-position training (all 4 GPUs)
+python scripts/train_deep.py \
+    --position Bag --epochs 50 --batch-size 512 --patience 10 --device cuda
 ```
 
-Outputs saved to `outputs/deep_baseline/<run_name>/`.
+Outputs saved to `outputs/execution-output/<run_name>/`.
 
-### Results
+### Results (Stage 3 experiments — Bag position, 20 000 stratified windows, seed=42)
 
-| Mode | Macro-F1 | Accuracy | Notes |
-|------|----------|---------|-------|
-| Bag, 5000 windows, 2 ep (smoke) | TBD | TBD | |
-| Bag, full dataset, 50 ep | TBD | TBD | |
+| Model | Batch Size | Epochs (trained) | Best Val Macro-F1 | Best Val Accuracy | Notes |
+|-------|-----------|-----------------|------------------|------------------|-------|
+| CNN1D | 128 | 9/10 (early stop) | 0.0866 | 13.2% | Patience=4; best at epoch 5 |
+| CNN1D | 256 | 10/10 | 0.0906 | 13.0% | Best at epoch 7 |
+| RF (baseline) | -- | -- | **0.6427** | **63.4%** | 354 stat+spectral features |
+
+Key findings:
+- RF with hand-crafted features outperforms CNN by ~7x on macro-F1 at 20 000 windows
+- CNN is collapsing to predict "Bike" (dominant confusion target in both runs)
+- Root cause: cosine LR decays too fast over 10 epochs; model needs more epochs or a warmup schedule
+- Next step: train CNN for 50+ epochs on full dataset; add residual connections or channel attention
 
 Multi-position fusion (planned):
 - Late fusion: average softmax logits across available positions
