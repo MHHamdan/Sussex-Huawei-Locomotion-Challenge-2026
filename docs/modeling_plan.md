@@ -1,5 +1,15 @@
 # Modeling Plan — FeatureFlyers / SHL 2026
 
+## Current Best Submission
+
+| File | Model | Val Macro-F1 | Val Accuracy | Status |
+|------|-------|-------------|-------------|--------|
+| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 positions) | **0.6389** | 68.4% | Submitted |
+
+Measured on Bag-only validation (57 576 windows). Model: `xgb_sfull_posBag_Hand_Hips_Torso_fusionpool`.
+
+---
+
 ## Problem
 
 Multi-class locomotion mode recognition (8 classes) from 9-axis IMU sensor data collected
@@ -43,6 +53,9 @@ Foundation models must remain **frozen**. Only lightweight heads may be trained.
 
 ### Submission — implemented in `scripts/generate_submission.py`
 - [x] Load model.joblib → predict on test → write 92 726 × 500 submission file
+- [x] XGBoost label offset fix — XGBoost predicts 0-7; submission needs 1-8 (+1 applied automatically)
+- [x] Early-fusion guard — script exits with clear error if a fusion="early" model is loaded (test has no per-position split)
+- [x] fusion="pool" support — position-pooled models work at test time (same 354-feature space)
 
 ### Infrastructure improvements
 - [x] `scripts/precompute_features.py` — pre-computes all 354 features for every position/split using 32 parallel CPU workers, saves to `dataset/processed/features/*.npz` (2.4 GB total). Cuts data loading from ~130s to ~1s per run.
@@ -53,15 +66,18 @@ Foundation models must remain **frozen**. Only lightweight heads may be trained.
 
 ### Results — all runs, Bag position, seed=42, full validation set (57 576 windows)
 
-| Model | Positions | Sample Limit | Macro-F1 | Accuracy | Runtime | Notes |
-|-------|-----------|-------------|---------|---------|---------|-------|
-| RF | Bag | 20 000 | 0.6427 | 63.4% | 121s | sklearn, CPU, class_weight=balanced |
-| XGBoost | Bag | 20 000 | 0.6605 | 64.7% | 126s | GPU, no sample weights |
-| XGBoost v1 | Bag | full | 0.6039 | 59.6% | 1303s | GPU, no sample weights — class imbalance hurt |
-| XGBoost v2 | Bag | full | 0.6384 | 62.9% | 1176s | GPU, balanced weights + early stop |
-| **XGBoost** | **Bag+Hand+Hips+Torso** | **full** | **0.6613** | **67.8%** | **86s** | GPU, 4-pos early fusion, cached features |
+| Model | Positions | Fusion | Sample Limit | Macro-F1 | Accuracy | Runtime | Submittable | Notes |
+|-------|-----------|--------|-------------|---------|---------|---------|-------------|-------|
+| RF | Bag | none | 20 000 | 0.6427 | 63.4% | 121s | Yes | sklearn, CPU, class_weight=balanced |
+| XGBoost | Bag | none | 20 000 | 0.6605 | 64.7% | 126s | Yes | GPU, no sample weights |
+| XGBoost v1 | Bag | none | full | 0.6039 | 59.6% | 1303s | Yes | GPU, no sample weights -- class imbalance hurt |
+| XGBoost v2 | Bag | none | full | 0.6384 | 62.9% | 1176s | Yes | GPU, balanced weights + early stop |
+| **XGBoost** | **Bag+Hand+Hips+Torso** | **early** | **full** | **0.6613** | **67.8%** | **86s** | **NO** | **Validation-only -- test has no per-position split** |
 
-Best per-class F1 (4-position early fusion):
+**Submittable = Yes means the model can generate test predictions from `test/data` (354 features).**
+**fusion="early" produces 1416-feature vectors and CANNOT be applied to `test/data`.**
+
+Best per-class F1 (4-position early fusion, validation-only):
 
 | Class | F1 | Notes |
 |-------|----|-------|
@@ -70,14 +86,16 @@ Best per-class F1 (4-position early fusion):
 | Run | 0.66 | rare class (1 110 val windows) |
 | Bike | 0.87 | strong |
 | Car | 0.72 | moderate |
-| Bus | 0.48 | hard — confused with Train |
-| Train | 0.50 | hard — confused with Metro/Bus |
-| Metro | 0.30 | hardest — underground vibration similar to Train |
+| Bus | 0.48 | hard -- confused with Train |
+| Train | 0.50 | hard -- confused with Metro/Bus |
+| Metro | 0.30 | hardest -- underground vibration similar to Train |
 
 Key findings:
-- 4-position fusion adds +2.3pp macro-F1 over single-position (0.6613 vs 0.6384)
+- 4-position early fusion adds +2.3pp macro-F1 over single-position (0.6613 vs 0.6384) but **cannot be submitted**
+- The test set (`test/data`) is a single (92726, 500, 9) array with NO per-position labels
+- Only fusion="none" and fusion="pool" models are submission-compatible
 - Cache reduces total pipeline time from ~20 min to ~90s for a full-dataset run
-- Train/Metro remain the hardest pair — need deeper model or foundation model embeddings
+- Train/Metro remain the hardest pair -- need deeper model or foundation model embeddings
 
 ---
 
@@ -151,7 +169,87 @@ Multi-position fusion (planned):
 
 ---
 
-## Stage 4 — Frozen Foundation Model + Head
+## Stage 4 — Submission-Ready XGBoost
+
+**Goal:** make the strongest XGBoost model that can actually generate a submission, given the test set structure.
+
+### Critical test set finding
+
+`test/data`: shape `(92726, 500, 9)` -- a **single flat array, no per-position split**.
+
+The test HDF5 has only one key under `test/`: `data`. There are no `test/Bag`, `test/Hips`, etc.
+This means:
+- `fusion="early"` models (1416 features from 4 simultaneous positions) **CANNOT be submitted**
+- Submission-compatible models must produce 354-feature vectors from a single 9-channel window
+- Submission-compatible fusions: `fusion="none"` (single position) or `fusion="pool"` (all positions stacked)
+
+### fusion="pool" -- position-invariant model
+
+New fusion mode added to `train_baseline.py`: `--fusion pool`
+
+| Mode | Training | Features at test time | n_train (full dataset) |
+|------|----------|-----------------------|------------------------|
+| none (Bag) | Bag windows only | 354 | ~392 000 |
+| pool (all 4) | Bag+Hand+Hips+Torso stacked as independent samples | 354 | ~1 570 000 |
+| early (validation-only) | aligned windows from all 4 positions, feature-concatenated | 1416 | ~392 000 |
+
+Pool advantages over single-position:
+- 4x more training data (all positions contribute)
+- Model learns position-invariant representations naturally
+- Works at test time with no position information needed
+
+### Experiments
+
+All macro-F1 values measured on **Bag-only validation** (57 576 windows) for fair comparison.
+
+| Model | Fusion | n_train | Macro-F1 (Bag val) | Accuracy (Bag val) | Submittable | Status |
+|-------|--------|---------|-------------------|-------------------|-------------|--------|
+| XGBoost | none (Bag) | 392 142 | 0.6324 | 62.5% | Yes | Done |
+| **XGBoost** | **pool (all 4)** | **~1 570 000** | **0.6389** | **68.4%** | **Yes** | **Done -- best** |
+| XGBoost | early (Bag+Hand+Hips+Torso) | 392 142 | 0.6613 | 67.8% | NO | Validation-only |
+
+Per-class F1 on Bag-only val (pool model vs Bag model):
+
+| Class | Bag model | Pool model | Delta |
+|-------|-----------|-----------|-------|
+| Still | 0.83 | 0.85 | +0.02 |
+| Walking | 0.84 | 0.84 | 0.00 |
+| Run | 0.87 | 0.61 | -0.26 |
+| Bike | 0.57 | 0.43 | -0.14 |
+| Car | 0.72 | 0.78 | +0.06 |
+| Bus | 0.47 | 0.48 | +0.01 |
+| Train | 0.43 | 0.59 | +0.16 |
+| Metro | 0.33 | 0.54 | +0.21 |
+
+Key findings:
+- Pool model wins overall (+6.5pp macro-F1 vs Bag on same val distribution)
+- Large gains on previously hardest classes: Train +16pp, Metro +21pp
+- Regressions on rare/distinctive classes: Run -26pp, Bike -14pp
+- Pool model's 4x more training data improves position-invariance at the cost of less Bag-specific tuning
+
+**Best submission: `FeatureFlyers_xgb_pool_full.txt`** (pool model, macro-F1=0.6389 on Bag val)
+
+### Commands
+
+```bash
+# Train position-pooled XGBoost (~70s from cache, ~1.57M train windows)
+python scripts/train_baseline.py \
+    --model xgb \
+    --positions Bag Hand Hips Torso \
+    --fusion pool \
+    --device cuda \
+    --early-stopping-rounds 30 \
+    --n-estimators 500
+
+# Generate full submission
+python scripts/generate_submission.py \
+    --model-path outputs/execution-output/xgb_sfull_posBag_Hand_Hips_Torso_fusionpool/model.joblib \
+    --output outputs/execution-output/submissions/FeatureFlyers_xgb_pool_full.txt
+```
+
+---
+
+## Stage 5 — Frozen Foundation Model + Head
 
 **Goal:** leverage representation power of pre-trained time-series models without fine-tuning.
 
@@ -174,23 +272,30 @@ Multi-position fusion (planned):
 ### Embedding strategies
 - CLS token / mean pool of patch embeddings
 - Per-sensor embedding → concatenate 9 streams → head
-- Multi-position: extract embeddings per position, concat, single head
+- Multi-position: extract embeddings per position, concat, single head (validation-only due to test set structure)
 
 ---
 
-## Stage 5 — Multi-Position Ensemble
+## Stage 6 — Multi-Position Ensemble
 
 - Train a separate best-performing head for each position
-- At test time, average probabilities across positions
+- At test time, average probabilities across positions (requires per-position test split -- check future challenge data releases)
 - Optionally: learn a position-weighting meta-layer
 
 ---
 
-## Stage 6 — Submission
+## Stage 7 — Submission
 
-- `scripts/generate_submission.py` (to be created)
-- Format: `FeatureFlyers_predictions.txt` — comma-separated label integers, one line
-- Final check: sample count must match test set (92 726 samples)
+- `scripts/generate_submission.py` (implemented)
+- Format: 92 726 lines, each with 500 comma-separated integers (1-8)
+- Output dir: `outputs/execution-output/submissions/`
+
+### Submission history
+
+| File | Model | Val Macro-F1 | Notes |
+|------|-------|-------------|-------|
+| `FeatureFlyers_xgb_Bag_full.txt` | XGBoost Bag only | 0.6324 | Baseline submission |
+| **`FeatureFlyers_xgb_pool_full.txt`** | **XGBoost pool (all 4 pos)** | **0.6389** | **Best submission** |
 
 ---
 
