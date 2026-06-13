@@ -242,8 +242,9 @@ def main() -> None:
     parser.add_argument("--model", choices=["rf", "lr", "xgb"], default="rf")
     parser.add_argument("--positions", nargs="+", default=["Bag"],
                         choices=POSITIONS)
-    parser.add_argument("--fusion", choices=["none", "early"], default="none",
-                        help="none=single position; early=concatenate features")
+    parser.add_argument("--fusion", choices=["none", "early", "pool"], default="none",
+                        help="none=single position; early=concatenate features (validation only); "
+                             "pool=stack all positions as independent samples (submission-compatible)")
     parser.add_argument("--n-estimators", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda",
@@ -256,8 +257,8 @@ def main() -> None:
                         help="Pre-computed feature cache dir (from precompute_features.py)")
     args = parser.parse_args()
 
-    if args.fusion == "early" and len(args.positions) < 2:
-        parser.error("--fusion early requires at least 2 positions")
+    if args.fusion in ("early", "pool") and len(args.positions) < 2:
+        parser.error(f"--fusion {args.fusion} requires at least 2 positions")
 
     rng = np.random.default_rng(args.seed)
 
@@ -307,21 +308,38 @@ def main() -> None:
 
     def _load_split(split: str, rng_: np.random.Generator):
         """Load features from cache if available, else extract from HDF5."""
-        positions = args.positions if args.fusion == "early" else [args.positions[0]]
-        cache_files = [args.cache_dir / f"{split}_{pos}.npz" for pos in positions]
+        if args.fusion == "pool":
+            positions_to_load = args.positions
+        elif args.fusion == "early":
+            positions_to_load = args.positions
+        else:
+            positions_to_load = [args.positions[0]]
+
+        cache_files = [args.cache_dir / f"{split}_{pos}.npz" for pos in positions_to_load]
         use_cache = all(cf.exists() for cf in cache_files)
 
         if use_cache:
             print(f"  [CACHE] loading {split} from {len(cache_files)} cached file(s) ...",
                   flush=True)
             t0 = time.time()
-            X_parts, y_ref = [], None
+            X_parts, y_parts = [], []
             for cf in cache_files:
                 d = np.load(cf)
                 X_parts.append(d["X"])
-                if y_ref is None:
-                    y_ref = d["y"]   # 1-based labels
-            X_full = np.concatenate(X_parts, axis=1)
+                y_parts.append(d["y"])   # 1-based labels
+
+            if args.fusion == "pool":
+                # Stack samples from all positions (4x more rows, same 354 features)
+                X_full = np.vstack(X_parts)
+                y_ref  = np.concatenate(y_parts)
+            elif args.fusion == "early":
+                # Concatenate feature vectors (same rows, 354*K features)
+                X_full = np.concatenate(X_parts, axis=1)
+                y_ref  = y_parts[0]
+            else:
+                X_full = X_parts[0]
+                y_ref  = y_parts[0]
+
             if args.sample_limit is not None:
                 classes = np.unique(y_ref)
                 k_per   = max(1, args.sample_limit // len(classes))
@@ -335,7 +353,22 @@ def main() -> None:
             print(f"    {X_full.shape}  ({time.time()-t0:.1f}s)\n")
             return X_full, y_ref
 
-        # No cache — fall back to HDF5 extraction
+        # No cache -- fall back to HDF5 extraction
+        if args.fusion == "pool":
+            # Pool via repeated HDF5 extraction, one position at a time
+            print(f"  [HDF5] pool-extracting {split} features ...", flush=True)
+            X_parts, y_parts = [], []
+            with h5py.File(HDF5_PATH, "r") as hf:
+                for pos in args.positions:
+                    X_pos, y_pos = load_features(
+                        hf, split, [pos], args.sample_limit, rng_, "none")
+                    X_parts.append(X_pos)
+                    y_parts.append(y_pos)
+            X = np.vstack(X_parts)
+            y = np.concatenate(y_parts)
+            print(f"    {X.shape}\n")
+            return X, y
+
         print(f"  [HDF5] extracting {split} features (run precompute_features.py to cache) ...",
               flush=True)
         with h5py.File(HDF5_PATH, "r") as hf:

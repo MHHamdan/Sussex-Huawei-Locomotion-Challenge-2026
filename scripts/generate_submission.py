@@ -2,28 +2,34 @@
 """
 Generate a challenge submission from a trained model.
 
-Reads the pre-windowed test set from HDF5 (92 726 windows × 500 samples × 9 sensors),
+Reads the pre-windowed test set from HDF5 (92 726 windows x 500 samples x 9 sensors),
 extracts features per window, predicts one label per window, then replicates
 that label for all 500 samples within the window to match the submission format.
 
 Submission format (required by SHL 2026):
-    92 726 lines, each containing 500 comma-separated integer labels.
-    Total predictions: 92 726 × 500 = 46 363 000.
+    92 726 lines, each containing 500 comma-separated integer labels (1-8).
+    Total predictions: 92 726 x 500 = 46 363 000.
+
+Test HDF5 structure: test/data only -- a single (92726, 500, 9) array with no
+position labels. This means only single-position or position-pooled models
+(fusion="none" or fusion="pool") can be used for submission.
+Models trained with fusion="early" expect N_POSITIONS x 354 features and
+CANNOT be applied to the test set.
 
 Usage:
     python scripts/generate_submission.py \\
-        --model-path outputs/baseline/<run>/model.joblib \\
-        --output outputs/submissions/FeatureFlyers_predictions.txt
+        --model-path outputs/execution-output/<run>/model.joblib \\
+        --output outputs/execution-output/submissions/FeatureFlyers_predictions.txt
 
-    # Smoke test — first 1000 windows only:
+    # Smoke test -- first 1000 windows only:
     python scripts/generate_submission.py \\
-        --model-path outputs/baseline/<run>/model.joblib \\
-        --output outputs/submissions/smoke.txt \\
+        --model-path outputs/execution-output/<run>/model.joblib \\
+        --output outputs/execution-output/submissions/smoke.txt \\
         --limit 1000
 
     # Preview only (no file written):
     python scripts/generate_submission.py \\
-        --model-path outputs/baseline/<run>/model.joblib \\
+        --model-path outputs/execution-output/<run>/model.joblib \\
         --dry-run
 """
 
@@ -38,7 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 HDF5_PATH = REPO_ROOT / "dataset" / "processed" / "shl2026.hdf5"
-DEFAULT_OUT = REPO_ROOT / "outputs" / "submissions" / "FeatureFlyers_predictions.txt"
+DEFAULT_OUT = REPO_ROOT / "outputs" / "execution-output" / "submissions" / "FeatureFlyers_predictions.txt"
 
 N_TEST_WINDOWS = 92_726
 WIN_SIZE = 500
@@ -178,6 +184,14 @@ def main() -> None:
     print(f"  Loaded: {clf.__class__.__name__}  "
           f"fusion={fusion}  positions={positions}  fft_top_k={fft_top_k}\n")
 
+    # Guard: early-fusion models require N_POSITIONS x 354 features but test/data
+    # is a single 9-channel array -- there are no per-position test splits.
+    if fusion == "early":
+        print("ERROR: fusion='early' models cannot be used for submission.")
+        print("       The test set (test/data) has no per-position splits.")
+        print("       Use a model trained with --fusion none or --fusion pool.")
+        sys.exit(1)
+
     with h5py.File(HDF5_PATH, "r") as hf:
         if "test" not in hf or "data" not in hf["test"]:
             print("ERROR: test/data not found in HDF5.")
@@ -189,16 +203,20 @@ def main() -> None:
     X_test_s = scaler.transform(X_test)
 
     # Predict
-    print("\n  Predicting …", flush=True)
+    print("\n  Predicting ...", flush=True)
     t_pred = time.time()
     preds = clf.predict(X_test_s)   # (N_WINDOWS,)
     print(f"  Done in {time.time()-t_pred:.1f}s")
+
+    # XGBoost trains on 0-based labels (0-7); submission requires 1-based (1-8)
+    if clf.__class__.__name__ == "XGBClassifier":
+        preds = preds.astype(np.int64) + 1
 
     # Distribution
     from collections import Counter
     LABEL_MAP = {1:"Still",2:"Walking",3:"Run",4:"Bike",
                  5:"Car",6:"Bus",7:"Train",8:"Metro"}
-    dist = {LABEL_MAP.get(k, k): v for k, v in
+    dist = {LABEL_MAP.get(k, str(k)): v for k, v in
             sorted(Counter(preds.tolist()).items())}
     print(f"\n  Prediction distribution: {dist}")
 
