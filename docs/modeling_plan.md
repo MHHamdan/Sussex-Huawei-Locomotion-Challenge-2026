@@ -253,26 +253,72 @@ python scripts/generate_submission.py \
 
 **Goal:** leverage representation power of pre-trained time-series models without fine-tuning.
 
-### Candidate foundation models
+### Protocol
 
-| Model | Type | Input format | Notes |
-|-------|------|-------------|-------|
-| [MOMENT](https://github.com/moment-timeseries-foundation-model/moment) | Transformer | `(batch, T, C)` patches | Time-series foundation model / Time-series BERT-style |
-| [Moirai](https://github.com/SalesforceAIResearch/uni2ts) | Transformer | Multivariate time series | Salesforce Uni2TS; includes Moirai models |
-| [TimesFM](https://github.com/google-research/timesfm) | Transformer | Univariate time series | Google Research; Apache-2.0 |
-| [TimeSformer](https://github.com/facebookresearch/TimeSformer) | Video Transformer | Video frames / adaptable | Can be adapted by reshaping sensor windows, but repo is archived |
+1. Freeze all encoder parameters (`requires_grad = False`).
+2. Forward all training/val windows through the frozen encoder in batches → `(N, embed_dim)` embeddings.
+3. Cache embeddings to `dataset/processed/embeddings/` (`.npz`, git-ignored).
+4. Train a lightweight MLP head `(embed_dim → 256 → 8)` on cached embeddings only.
+5. Report macro-F1 vs XGBoost pool baseline (0.6389).
 
-### Protocol (all models)
-1. Freeze all foundation model parameters (`requires_grad = False`).
-2. Forward-pass windows through the model → embedding vector(s).
-3. Attach trainable head: Linear(d_model → 8) or MLP(d_model → 256 → 8).
-4. Train only the head (seconds/minutes not hours).
-5. No data augmentation on foundation model inputs to avoid distribution shift.
+### Implementation
 
-### Embedding strategies
-- CLS token / mean pool of patch embeddings
-- Per-sensor embedding → concatenate 9 streams → head
-- Multi-position: extract embeddings per position, concat, single head (validation-only due to test set structure)
+| File | Purpose |
+|------|---------|
+| `src/featureflyers_shl/models/foundation.py` | `MomentEncoder`, `FallbackEncoder`, `get_encoder()` factory |
+| `scripts/train_foundation_head.py` | End-to-end: embed extraction + head training + eval |
+
+### Encoders
+
+| Encoder | Params | Embed dim | Notes |
+|---------|--------|-----------|-------|
+| `moment` | 341M (frozen) | 1024 | MOMENT-1-large; `pip install momentfm`; downloads ~1.4 GB once |
+| `fallback` | — | 1024 | Frozen orthogonal random projection; NOT a real foundation model |
+
+Input format: `(B, 500, 9)` → MOMENT internally converts to `(B, 9, 500)` with mean-pool over patches.
+
+### Commands
+
+```bash
+# Smoke test -- fallback encoder (no download, fast)
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 5000 --encoder fallback \
+    --epochs 2 --batch-size 256 --device cuda:1
+
+# Smoke test -- MOMENT encoder (FP16 model, preloaded RAM, batch=256 extraction)
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 1000 --encoder moment \
+    --epochs 2 --batch-size 256 --extract-batch-size 256 --device cuda:1
+
+# Full Bag run with MOMENT (~80 min first run; subsequent runs skip extraction)
+python scripts/train_foundation_head.py \
+    --position Bag --encoder moment \
+    --epochs 30 --batch-size 512 --extract-batch-size 256 \
+    --patience 10 --device cuda:1 \
+    > outputs/execution-output/foundation_moment_full_run.log 2>&1
+```
+
+### Results
+
+Baseline to beat: XGBoost pool, macro-F1=**0.6389**, accuracy=68.4%
+
+| Run | Encoder | n_train | Epochs run | Best epoch | Val Macro-F1 | Val Accuracy | Embed time | Notes |
+|-----|---------|---------|-----------|-----------|-------------|-------------|------------|-------|
+| fallback smoke | fallback (placeholder) | 5 000 | 2 | 2 | 0.1111 | 14.8% | 0.3s | Random projection, expected near-random result |
+| MOMENT smoke | moment | 5 000 | 2 | 1 | 0.0838 | 12.4% | 163s/split | Too few epochs/data, near-random, pipeline verified |
+| **MOMENT full** | **moment** | **392 142** | **21** (early stop) | **11** | **0.2108** | **20.2%** | 80 min train + 12 min val | See analysis below |
+
+**Full run analysis (MOMENT full, Bag position):**
+- Best epoch 11 (val macro-F1 = 0.2108); early stopping fired at epoch 21 (patience=10)
+- Training accuracy climbed steadily (34%→63%) while val oscillated at 16–20% → train/val gap indicates the frozen embeddings don't transfer cleanly to locomotion
+- Best per-class: Run 0.38 F1, Car 0.37; worst: Bus 0.03, Train 0.13, Metro 0.13
+- **Conclusion:** Frozen MOMENT-1-large + MLP head scores **−0.4281 vs XGBoost pool**. Generic time-series embeddings (trained on diverse domains) cannot match 354 hand-crafted IMU features. Fine-tuning the encoder would be needed to close this gap, but is prohibited by Stage 5 rules.
+
+**Extraction speed (FP16 model + preloaded RAM):**
+- FP16 model: 6.86 GiB GPU (vs 9.64 GiB FP32), freeing ~4 GiB for batch activations
+- Preload: 392K windows loaded into 7 GB RAM at init (21s); O(1) `__getitem__`, GPU at sustained 100%
+- Throughput: **82 win/s at batch=256** (vs ~21 win/s DataParallel lazy; ~4× speedup)
+- Full Bag extraction: 80 min; embeddings cached at `dataset/processed/embeddings/`; subsequent runs skip extraction entirely
 
 ---
 
