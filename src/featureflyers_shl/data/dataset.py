@@ -239,6 +239,9 @@ def _read_windows_batched(
         block   = ds[c_start:c_end, :]                  # one HDF5 chunk read
         for gi in grp:
             offset = int(sorted_starts[gi]) - c_start
-            buf[inv_order[gi]] = block[offset : offset + WIN_SIZE, :]
+            # order[gi] = which original window lives at sorted position gi;
+            # inv_order[gi] is the *sorted* position of original window gi —
+            # using it here was wrong (double-inversion → shuffled data/label pairs).
+            buf[order[gi]] = block[offset : offset + WIN_SIZE, :]
 
     return buf

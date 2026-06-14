@@ -1,0 +1,89 @@
+# Stage 5 — Foundation model ablation configuration
+# Reference for the planned experiment table (A–G).
+# Pass individual flags on the CLI; this file documents the canonical settings.
+
+encoder: moment          # moment | fallback | chronos (not installed) | uni2ts (not installed)
+position: Bag            # Bag | Hand | Hips | Torso
+sample_limit: 20000      # null = full dataset; 20000 for ablation sweep; 5000 for smoke tests
+
+# Preprocessing
+norm: per-window         # none | per-window | channel-global | train-stats
+include_magnitude: false # append Acc/Gyr/Mag Euclidean magnitude channels (+3 channels)
+include_delta: false     # append first-difference channels (+C channels)
+
+# Embedding
+embed_strategy: mean_pool  # mean_pool | last_patch | sensorwise | flatten_patches
+
+# Head
+head: mlp                # linear | mlp | residual_mlp | xgb | logistic
+hybrid_stat_features: false  # if true, concatenate 354-dim stat features
+
+# PyTorch head hyper-parameters (ignored for xgb / logistic)
+epochs: 30
+batch_size: 512
+extract_batch_size: 64   # keep low to avoid VRAM OOM during encoding
+lr: 1.0e-3
+dropout: 0.3
+hidden: 256
+patience: 10
+
+seed: 42
+device: cuda:1
+output_dir: outputs/execution-output
+
+# ----------------------------------------------------------------
+# Planned ablation table (all use position=Bag)
+# ----------------------------------------------------------------
+# Exp | encoder | norm          | mag | delta | strategy  | head | hybrid | limit
+# ----+---------+---------------+-----+-------+-----------+------+--------+------
+#  A  | moment  | none          |  -  |   -   | mean_pool | mlp  |   -    | 20k
+#  B  | moment  | per-window    |  -  |   -   | mean_pool | mlp  |   -    | 20k
+#  C  | moment  | channel-global|  -  |   -   | mean_pool | mlp  |   -    | 20k
+#  D  | moment  | per-window    |  -  |   -   | mean_pool | residual_mlp | - | 20k
+#  E  | moment  | per-window    |  -  |   -   | mean_pool | xgb  |   -    | 20k
+#  F  | moment  | per-window    |  -  |   -   | mean_pool | xgb  |  yes   | 20k
+#  G  | moment  | per-window    |  -  |   -   | sensorwise| xgb  |   -    | 20k (slow)
+#
+# After sweep, run best 1-2 configs on full Bag dataset.
+#
+# CLI commands (device=cuda:1, adjust as needed):
+#
+# Exp A:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm none --embed-strategy mean_pool --head mlp \
+#       --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+#
+# Exp B:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm per-window --embed-strategy mean_pool --head mlp \
+#       --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+#
+# Exp C:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm channel-global --embed-strategy mean_pool --head mlp \
+#       --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+#
+# Exp D:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm per-window --embed-strategy mean_pool --head residual_mlp \
+#       --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+#
+# Exp E:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm per-window --embed-strategy mean_pool --head xgb --device cuda:1
+#
+# Exp F:
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm per-window --embed-strategy mean_pool --head xgb \
+#       --hybrid-stat-features --device cuda:1
+#
+# Exp G (sensorwise — slow; each of 9 channels forwarded through MOMENT separately):
+#   python scripts/train_foundation_head.py \
+#       --position Bag --sample-limit 20000 --encoder moment \
+#       --norm per-window --embed-strategy sensorwise --head xgb --device cuda:1
