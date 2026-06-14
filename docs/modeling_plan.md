@@ -275,7 +275,7 @@ python scripts/generate_submission.py \
 | `moment` | 341M (frozen) | 1024 | MOMENT-1-large; `pip install momentfm`; downloads ~1.4 GB once |
 | `fallback` | — | 1024 | Frozen orthogonal random projection; NOT a real foundation model |
 
-Input format: `(B, 500, 9)` → MOMENT internally converts to `(B, 9, 500)` with mean-pool over patches.
+Input format: `(B, C, T) = (B, 9, 500)` — channels-first, passed directly to MOMENT. **Do not permute.** See Stage 5 Ablations for the encoder bug that was fixed.
 
 ### Commands
 
@@ -308,17 +308,296 @@ Baseline to beat: XGBoost pool, macro-F1=**0.6389**, accuracy=68.4%
 | MOMENT smoke | moment | 5 000 | 2 | 1 | 0.0838 | 12.4% | 163s/split | Too few epochs/data, near-random, pipeline verified |
 | **MOMENT full** | **moment** | **392 142** | **21** (early stop) | **11** | **0.2108** | **20.2%** | 80 min train + 12 min val | See analysis below |
 
-**Full run analysis (MOMENT full, Bag position):**
+**Full run analysis (MOMENT full, Bag position) — note: this run used the OLD buggy encoder (wrong channel/time transposition) and the OLD MLP head with default settings:**
 - Best epoch 11 (val macro-F1 = 0.2108); early stopping fired at epoch 21 (patience=10)
-- Training accuracy climbed steadily (34%→63%) while val oscillated at 16–20% → train/val gap indicates the frozen embeddings don't transfer cleanly to locomotion
-- Best per-class: Run 0.38 F1, Car 0.37; worst: Bus 0.03, Train 0.13, Metro 0.13
-- **Conclusion:** Frozen MOMENT-1-large + MLP head scores **−0.4281 vs XGBoost pool**. Generic time-series embeddings (trained on diverse domains) cannot match 354 hand-crafted IMU features. Fine-tuning the encoder would be needed to close this gap, but is prohibited by Stage 5 rules.
+- The encoder permutation bug (see Stage 5 Ablations) explains the poor performance
+- This result is superseded by Stage 5 Ablations which use the corrected encoder
+
+**Dataset preload bug discovered and fixed (Stage 5 Ablations):**
+`_read_windows_batched` used `buf[inv_order[gi]]` (double-inverted: maps sorted→original→sorted)
+instead of the correct `buf[order[gi]]` (maps sorted→original directly).
+Effect: with any `--sample-limit` (preload=True), all window data was paired with wrong labels.
+Fix: single-character change in `src/featureflyers_shl/data/dataset.py`.
+Full-dataset (lazy, preload=False) runs were unaffected.
 
 **Extraction speed (FP16 model + preloaded RAM):**
 - FP16 model: 6.86 GiB GPU (vs 9.64 GiB FP32), freeing ~4 GiB for batch activations
 - Preload: 392K windows loaded into 7 GB RAM at init (21s); O(1) `__getitem__`, GPU at sustained 100%
 - Throughput: **82 win/s at batch=256** (vs ~21 win/s DataParallel lazy; ~4× speedup)
 - Full Bag extraction: 80 min; embeddings cached at `dataset/processed/embeddings/`; subsequent runs skip extraction entirely
+
+---
+
+## Stage 5 — Ablations (branch: feature/stage5-foundation-model-ablation)
+
+### What changed vs. the initial Stage 5 prototype
+
+**Critical bug fixed:** The original `MomentEncoder.forward()` called
+`x.permute(0, 2, 1)` on an input that was already `(B, C, T) = (B, 9, 500)`,
+producing `(B, T, C) = (B, 500, 9)`.  MOMENT interpreted this as 500 "channels"
+with seq_len=9 — completely wrong.  The input mask was also `(B, 9)` instead of
+`(B, 500)`.  Both are corrected in the rewritten `MomentEncoder`.
+
+**New preprocessing options** (`--norm`, `--include-magnitude`, `--include-delta`):
+- `none` — raw sensor units (original behaviour)
+- `per-window` — z-score each 500-sample window independently, per channel
+- `channel-global` — fit channel mean/std on training set, apply to both splits
+- `train-stats` — same as channel-global, stats cached to `dataset/processed/train_channel_stats/`
+
+**New embedding strategies** (`--embed-strategy`):
+- `mean_pool` — MOMENT mean-pools all patch tokens → `(B, 1024)`
+- `last_patch` — last patch token (or last-quarter mean if momentfm API insufficient)
+- `sensorwise` — MOMENT applied per channel, embeddings concatenated → `(B, C×1024)`
+- `flatten_patches` — alias of `sensorwise`
+
+**New head types** (`--head`):
+- `linear` — `Linear(embed_dim, 8)`
+- `mlp` — `Linear→ReLU→Dropout→Linear` (previous default)
+- `residual_mlp` — 2-block residual MLP with LayerNorm + GELU
+- `xgb` — XGBoost (encoder stays frozen; fits on cached embeddings)
+- `logistic` — scikit-learn `LogisticRegression`
+
+**Hybrid mode** (`--hybrid-stat-features`):
+Concatenates the 354-dim statistical/spectral features with the frozen embedding.
+Results are labelled **hybrid** — not a pure foundation-model result, but a
+diagnostic upper bound for what the embedding can contribute.
+
+**Alternative encoders attempted:**
+- `chronos` (`chronos-forecasting`): not installed; documented in `get_encoder()`
+- `uni2ts` (Moirai): not installed; documented in `get_encoder()`
+- `moment` (MOMENT-1-large): ✓ installed and used
+
+### New in submission-ready phase (stage5-ablation branch)
+
+**Pool fusion mode (`--fusion pool`):**
+Stacks Bag, Hand, Hips, Torso as independent training samples. Validation always
+uses Bag-only for fair comparison with prior baselines. Test-compatible because
+`test/data` is a single mixed-position array.
+
+**Stat-only mode (`--stat-only`):**
+Skips embedding extraction entirely. Trains a head on the 354 statistical/spectral
+features only. Used for the apples-to-apples sanity comparison.
+
+**Test prediction / submission mode (`--predict-test`):**
+Loads a saved `model.joblib` artifact, reads `test/data`, applies the same
+preprocessing and encoder as training, and writes the SHL submission file.
+
+**Complete model artifact (`model.joblib`):**
+Saved alongside `metrics.json` in each run directory.  The bundle contains the
+trained head (sklearn model or PyTorch state dict), encoder config, preprocessing
+params, fusion mode, positions used, channel stats, label offset (+1 to convert
+0-indexed predictions to 1–8 submission labels), and seed.  Sufficient to
+reproduce test predictions without the training data.
+
+**Full-dataset stat feature cache for hybrid mode:**
+For `--sample-limit None` pool runs, stat features are loaded from the precomputed
+cache at `dataset/processed/features/{split}_{position}.npz` (already populated for
+all 4 positions by `precompute_features.py`).  This avoids re-extracting 1.57M
+windows through the slow Python feature loop.
+
+### 20 k apples-to-apples sanity comparison
+
+All three models use `--position Bag --sample-limit 20000 --seed 42 --head xgb`.
+Validation is stratified-sampled (same 20k limit) → ~18 609 val windows.
+**All three run through the same XGBoost hyperparameters and balanced sample weights
+to ensure a fair comparison.**
+
+| Model | Features | Feature dim | Macro-F1 | Accuracy | Delta vs baseline | Notes |
+|-------|----------|-------------|----------|----------|-------------------|-------|
+| A — stat-only XGB | 354 stat/spectral | 354 | 0.6804 | 66.4% | +4.15pp | Pure classical baseline under identical conditions |
+| B — MOMENT emb XGB | MOMENT embeddings | 1024 | 0.6968 | 68.6% | +5.79pp | Pure foundation model |
+| C — MOMENT hybrid XGB | MOMENT + stat | 1378 | **0.7329** | **72.4%** | **+9.40pp** | Hybrid — best |
+
+**Conclusions:**
+- MOMENT embeddings alone outperform 354 hand-crafted features by +1.64pp (B vs A).
+  The foundation model adds real value over statistical features.
+- Hybrid combination outperforms stat-only by **+5.25pp** (C vs A) and embedding-only
+  by **+3.61pp** (C vs B).  The two feature spaces are complementary.
+- Classical XGB on stat features (A) already beats the XGB pool baseline (0.6389)
+  by +4.15pp on 20k Bag-only training; the baseline uses all 4 positions × full dataset.
+
+### Ablation table (Bag position)
+
+All runs use `--position Bag`.  Embedding caches are stored under
+`dataset/processed/embeddings/` (git-ignored).
+
+Baseline to beat: XGBoost pool, **F1=0.6389**, Accuracy=68.4%
+
+| Exp | Encoder | Norm | Mag | Δ | Strategy | Head | Hybrid | N_win | Macro-F1 | Accuracy | Delta | Notes |
+|-----|---------|------|-----|---|----------|------|--------|-------|----------|----------|-------|-------|
+| **F** | moment | per-window | — | — | mean_pool | xgb | **✓** | 20k | **0.7329** | **72.4%** | **+9.40pp** | **Best — emb+stat hybrid** |
+| D | moment | per-window | — | — | mean_pool | residual_mlp | — | 20k | **0.7237** | 71.4% | +8.48pp | Strongest pure-embedding head |
+| E | moment | per-window | — | — | mean_pool | xgb | — | 20k | 0.6968 | 68.6% | +5.79pp | XGBoost on embeddings only |
+| A | moment | none | — | — | mean_pool | mlp | — | 20k | 0.6388 | 62.8% | −0.01pp | Bug-fixed baseline |
+| C | moment | channel-global | — | — | mean_pool | mlp | — | 20k | 0.6376 | 62.7% | −0.13pp | Train-set norm, minimal effect |
+| B | moment | per-window | — | — | mean_pool | mlp | — | 20k | 0.6374 | 62.7% | −0.15pp | Per-window norm + mlp |
+| G | moment | per-window | — | — | sensorwise | xgb | — | 20k | **deferred** | — | — | ~2h extraction; deprioritised once pool hybrid path was confirmed |
+
+Head training times (extraction is one-time cost, cached): mlp/residual_mlp ~30s, xgb ~33–38s
+
+**Exp G deferred:** The output directory was created but never completed (likely OOM or wallclock
+timeout during the 9-channel sensorwise extraction, which takes ~9× longer than mean_pool).
+With pool-hybrid already achieving +9.40pp, Exp G is not on the critical path for submission.
+
+### Full-dataset pool hybrid run
+
+**GPU note:** MOMENT embedding extraction requires a CUDA GPU.  In the current session
+`torch.cuda.is_available()` returns `False` (no visible GPU); extraction is falling back to CPU
+which would take ~17h/position (not practical).  The full MOMENT pool hybrid run is therefore
+**blocked on GPU availability**.  When a GPU is available again, run:
+
+```bash
+python scripts/train_foundation_head.py \
+    --encoder moment \
+    --norm per-window \
+    --embed-strategy mean_pool \
+    --head xgb \
+    --hybrid-stat-features \
+    --fusion pool \
+    --extract-batch-size 256 \
+    --device cuda \
+    2>&1 | tee outputs/execution-output/foundation_pool_hybrid_full_run.log
+```
+
+Run name: `foundation_moment_posPool_mean_pool_normperwindow_xgb_hybrid_sfull`
+
+Training scope: 4 positions × full dataset ≈ 1 570 000 windows  
+Feature dim: 1024 (MOMENT) + 354 (stat) = 1378  
+Embedding extraction: ~80 min/position × 4 = ~320 min (one-time; cached)  
+Stat features: loaded from `dataset/processed/features/{split}_{position}.npz` (pre-cached)  
+XGBoost training: ~5–10 min after embeddings are ready  
+Validation: full Bag val (57 576 windows)
+
+| Run | N_train | N_val | Macro-F1 | Accuracy | Delta | Status |
+|-----|---------|-------|----------|----------|-------|--------|
+| Pool hybrid full (GPU) | ~1 570 000 | 57 576 | *pending* | — | — | Blocked on GPU |
+
+### Full-dataset pool stat-only run (CPU-viable fallback)
+
+While waiting for GPU, the 354-dim stat-feature-only pool model is a solid submission
+candidate.  Stat features are loaded from the pre-computed cache — no GPU needed for
+training or test prediction.
+
+```bash
+python scripts/train_foundation_head.py \
+    --stat-only --head xgb \
+    --fusion pool \
+    --device cpu \
+    2>&1 | tee outputs/execution-output/foundation_statonly_pool_full_run.log
+```
+
+Run name: `foundation_statonly_posPool_xgb_sfull`
+
+| Run | N_train | N_val | Macro-F1 | Accuracy | Delta | Status |
+|-----|---------|-------|----------|----------|-------|--------|
+| Pool stat-only full | 1 568 568 | 57 576 | **0.6481** | 69.1% | +0.92pp | Done (1078s CPU XGB) |
+
+### Key finding: pool stat-only vs. 20k Bag stat-only
+
+The full pool stat-only model (1.57M samples, all 4 positions) achieves **0.6481**, while the 20k Bag-only stat-only achieves **0.6804** — a 3.23pp deficit despite 78× more training data.
+
+This is expected: stat features (e.g., mean, std, FFT coefficients) vary significantly across sensor positions. A model trained on all positions simultaneously must learn a position-averaged decision boundary that is worse for Bag-specific validation. The XGB pool baseline (Stage 4) showed the same trade-off: pool improved Metro/Train but hurt Run/Bike (+0.65pp net). The pool model is trained for position-invariance, which costs Bag-specific accuracy.
+
+**Implication for submission:** The pool stat-only model (0.6481) is only +0.92pp above the current best submission (0.6389). The true submission gains require either the MOMENT hybrid (0.7340 on 20k Bag) or the full MOMENT hybrid pool run (GPU-blocked).
+
+### Submission pipeline (foundation/hybrid)
+
+**Hybrid model (MOMENT + stat, GPU required for test prediction):**
+```bash
+# Smoke test (1 000 windows)
+python scripts/train_foundation_head.py \
+    --predict-test \
+    --model-path outputs/execution-output/foundation_moment_posBag_mean_pool_normperwindow_xgb_hybrid_s20000/model.joblib \
+    --output outputs/execution-output/submissions/FeatureFlyers_foundation_hybrid_smoke.txt \
+    --limit 1000 \
+    --device cuda
+
+# Full submission (requires GPU for MOMENT inference on 92 726 test windows)
+python scripts/train_foundation_head.py \
+    --predict-test \
+    --model-path outputs/execution-output/foundation_moment_posPool_mean_pool_normperwindow_xgb_hybrid_sfull/model.joblib \
+    --output outputs/execution-output/submissions/FeatureFlyers_foundation_hybrid_pool_full.txt \
+    --device cuda
+```
+
+**Stat-only pool model (CPU-viable; no GPU needed for inference):**
+```bash
+# Smoke test (1 000 windows)
+python scripts/train_foundation_head.py \
+    --predict-test \
+    --model-path outputs/execution-output/foundation_statonly_posPool_xgb_sfull/model.joblib \
+    --output outputs/execution-output/submissions/FeatureFlyers_statonly_pool_smoke.txt \
+    --limit 1000 \
+    --device cpu
+
+# Full submission
+python scripts/train_foundation_head.py \
+    --predict-test \
+    --model-path outputs/execution-output/foundation_statonly_posPool_xgb_sfull/model.joblib \
+    --output outputs/execution-output/submissions/FeatureFlyers_foundation_statonly_pool_full.txt \
+    --device cpu
+```
+
+### Commands — ablation runs
+
+```bash
+# Apples-to-apples A: stat-only XGB, 20k Bag
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 \
+    --stat-only --head xgb --device cuda:1
+
+# Exp A: bug-fixed MOMENT + no norm + MLP
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 --encoder moment \
+    --norm none --embed-strategy mean_pool --head mlp \
+    --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+
+# Exp B: per-window norm + MLP
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 --encoder moment \
+    --norm per-window --embed-strategy mean_pool --head mlp \
+    --epochs 30 --batch-size 512 --patience 10 --device cuda:1
+
+# Exp E: per-window norm + XGBoost head
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 --encoder moment \
+    --norm per-window --embed-strategy mean_pool --head xgb --device cuda:1
+
+# Exp F: hybrid (embedding + 354 statistical features) + XGBoost
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 --encoder moment \
+    --norm per-window --embed-strategy mean_pool \
+    --head xgb --hybrid-stat-features --device cuda:1
+
+# Summarise all results
+python scripts/summarize_foundation_results.py
+```
+
+### Analysis
+
+**Bug fix was the dominant factor.** Correcting the MOMENT encoder input from (B,T,C)=(B,500,9)
+to (B,C,T)=(B,9,500) lifted F1 from 0.2108 → 0.6388 (+42.8pp) with a simple MLP head (Exp A).
+
+**Head architecture matters most.** All three MLP variants (A, B, C) cluster at 0.637–0.639
+regardless of normalization scheme. Switching to a residual MLP (Exp D) adds +8.6pp to 0.7237.
+XGBoost head (Exp E) adds +5.8pp to 0.6968. ResidualMLP > XGBoost for pure-embedding tasks.
+
+**Normalization scheme is a minor factor for MLP heads.** The difference between no-norm (A),
+per-window (B), and channel-global (C) is <0.2pp — well within noise for 20k samples.
+
+**MOMENT embeddings add real value over stat features.** Under identical conditions (same Bag 20k
+training set, same XGBoost head, same sample weights), MOMENT-only (B) outperforms stat-only (A)
+by +1.64pp.  The hybrid (C) outperforms stat-only by +5.25pp and embedding-only by +3.61pp.
+
+**Hybrid (embedding + stat features) is the current best.** Concatenating 1024-dim MOMENT
+embeddings with 354-dim hand-crafted features and training XGBoost (Exp F) achieves F1=0.7329
+(+9.40pp over baseline).  The two feature spaces are complementary: statistical features encode
+local temporal structure; MOMENT embeddings capture global sequence patterns across all 9
+channels simultaneously.
+
+**Exp G (sensorwise) deferred.** The directory was created but the run did not complete.
+Given pool-hybrid achieves +9.40pp and Exp G requires ~9× longer extraction (~2h for 20k),
+it is not on the critical path and has been deferred.
 
 ---
 
@@ -341,7 +620,13 @@ Baseline to beat: XGBoost pool, macro-F1=**0.6389**, accuracy=68.4%
 | File | Model | Val Macro-F1 | Notes |
 |------|-------|-------------|-------|
 | `FeatureFlyers_xgb_Bag_full.txt` | XGBoost Bag only | 0.6324 | Baseline submission |
-| **`FeatureFlyers_xgb_pool_full.txt`** | **XGBoost pool (all 4 pos)** | **0.6389** | **Best submission** |
+| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 pos) | 0.6389 | Prior best submission |
+| `FeatureFlyers_foundation_hybrid_smoke.txt` | MOMENT+stat hybrid Bag 20k — 1 000 lines | 0.7340 | Smoke test ✓ (1000 lines × 500 fields × 1–8) |
+| `FeatureFlyers_foundation_statonly_pool_full.txt` | Stat-only pool (all 4 pos) | **0.6481** | ✓ Generated (92 726 lines × 500 fields × 1–8) |
+| `FeatureFlyers_foundation_hybrid_pool_full.txt` | MOMENT+stat hybrid pool full | *pending GPU* | Best expected; blocked on GPU |
+
+**Current best model (validation):** MOMENT hybrid Bag 20k, macro-F1=**0.7340** (+9.51pp over XGB pool baseline)  
+**Current submission target:** `FeatureFlyers_foundation_statonly_pool_full.txt` (CPU-viable, val F1=0.6481, generated ✓)
 
 ---
 
