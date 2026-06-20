@@ -4,9 +4,11 @@
 
 | File | Model | Val Macro-F1 | Val Accuracy | Status |
 |------|-------|-------------|-------------|--------|
-| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 positions) | **0.6389** | 68.4% | Submitted |
+| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 positions) | 0.6389 | 68.4% | Submitted |
+| `FeatureFlyers_foundation_hybrid_pool_full.txt` | MOMENT+stat hybrid pool full | **0.6970** | 73.0% | Generated (Stage 6) |
 
-Measured on Bag-only validation (57 576 windows). Model: `xgb_sfull_posBag_Hand_Hips_Torso_fusionpool`.
+Best **model** (not yet submitted): InceptionTime pool full — val Macro-F1=**0.7265**, Accuracy=76.4% (Stage 8).  
+Measured on Bag-only validation (57 576 windows).
 
 ---
 
@@ -470,7 +472,23 @@ Validation: full Bag val (57 576 windows)
 
 | Run | N_train | N_val | Macro-F1 | Accuracy | Delta | Status |
 |-----|---------|-------|----------|----------|-------|--------|
-| Pool hybrid full (GPU) | ~1 570 000 | 57 576 | *pending* | — | — | Blocked on GPU |
+| **Pool hybrid full (MOMENT+stat, XGB CPU)** | **1 568 568** | **57 576** | **0.6970** | **73.0%** | **+5.81pp** | **Done (2026-06-20)** |
+
+Per-class F1 (Stage 6 pool hybrid):
+
+| Class | F1 | Notes |
+|-------|----|-------|
+| Still | 0.84 | strong |
+| Walking | 0.89 | strong |
+| Run | 0.64 | recall 48% — rare class hurt by pool position-mixing |
+| Bike | 0.65 | recall 52% — same issue |
+| Car | 0.74 | improved vs stat-only |
+| Bus | 0.53 | precision 40%, recall 77% — over-predicts Bus |
+| Train | 0.65 | much improved vs baseline |
+| Metro | 0.64 | much improved vs baseline (was 0.30 in Stage 2) |
+
+**XGB OOM fix:** `_train_sklearn_head` had `device="cuda"` hardcoded. Added `--xgb-device` flag (default `cpu`) so encoder stays on GPU for extraction while XGB fits on CPU.  
+XGB fit time: 3841s (64 min) on 40 CPU cores, 1378-dim × 1.57M samples.
 
 ### Full-dataset pool stat-only run (CPU-viable fallback)
 
@@ -601,7 +619,122 @@ it is not on the critical path and has been deferred.
 
 ---
 
-## Stage 6 — Multi-Position Ensemble
+## Stage 7 — LoRA MOMENT Fine-Tuning (Paper Experiment — NOT Submittable)
+
+**Competition constraint:** Foundation models must remain frozen. This stage is a paper experiment only.
+
+### Protocol
+
+Apply LoRA adapters (rank=8, alpha=16) to the top 4 transformer blocks (20–23) of MOMENT-1-large,
+freeze all other weights. Train on 20K windows per position (pool, 80K total) with batch=64.
+
+| Component | Params | Notes |
+|-----------|--------|-------|
+| MOMENT backbone | 341M (frozen) | Top 4 blocks get LoRA; rest fully frozen |
+| LoRA adapters (q, v projections) | 860K trainable (0.25%) | peft 0.6.2, blocks 20–23 |
+| Classification head | ~8K trainable | Linear(1024→8) |
+
+**Gradient fix:** T5Stack gradient checkpointing blocks gradient flow when no input `requires_grad=True`.
+Workaround: forward hook on `patch_embedding` to force `requires_grad_(True)` on embedding outputs.
+`enable_input_require_grads()` not available in peft 0.6.2.
+
+### Launch
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/train_stage7_lora.py \
+    --epochs 30 --patience 7 --batch-size 64 \
+    --sample-limit 20000 --lora-rank 8 --lora-alpha 16 --lora-blocks 4 \
+    --device cuda:1 --num-workers 0 \
+    2>&1 | tee outputs/execution-output/stage7_lora_full.log
+```
+
+### Results
+
+| Run | N_train | Epochs | Best Macro-F1 | Accuracy | Notes |
+|-----|---------|--------|--------------|---------|-------|
+| LoRA r=8 α=16 blocks=4 | 80 000 | running | pending | pending | GPU 1, ~100% util |
+
+---
+
+## Stage 8 — InceptionTime End-to-End (Pool Fusion)
+
+**Goal:** Train a custom deep model (no frozen FM) on all 4 positions. Fully submittable.
+
+### Architecture — `src/featureflyers_shl/models/inception.py`
+
+| Block | Description | Output channels |
+|-------|-------------|----------------|
+| 3× Inception module (block 1) | Parallel Conv1d kernels 40/20/10 + MaxPool; bottleneck=32 | 4×32=128 |
+| Residual shortcut | Conv1d(1×1, 9→128) + BN | — |
+| 3× Inception module (block 2) | Same as block 1, in_channels=128 | 128 |
+| Residual shortcut | Conv1d(1×1, 128→128) + BN | — |
+| GlobalAvgPool + Dropout(0.3) | — | 128 |
+| Linear(128 → 8) | Classifier | 8 logits |
+
+Total: **492,232 trainable params** (492K — lightweight vs MOMENT 341M).
+
+### Training — `scripts/train_stage8_inception.py`
+
+- Pool fusion: 4 × 392 142 = 1 568 568 training windows preloaded into RAM (`preload=True`)
+- Validation: Bag-only (57 576 windows), also preloaded
+- Per-window z-score normalization applied on GPU before every forward pass
+- AMP (FP16) training with gradient clipping (max_norm=1.0)
+- NaN batch skip: 2 known NaN windows in train/Hips handled via `nan_to_num`
+- Class-weighted cross-entropy; AdamW + CosineAnnealingLR; batch=512
+
+```bash
+python scripts/train_stage8_inception.py \
+    --epochs 100 --patience 15 --batch-size 512 --device cuda:0 \
+    2>&1 | tee outputs/execution-output/stage8_inception_pool_full.log
+```
+
+### Results
+
+Preload time: 76.2s for all 4 positions + val. Epoch time: ~272s/epoch.
+
+| Ep | TrainLoss | TrainAcc | ValAcc | MacroF1 | Notes |
+|----|----------|---------|--------|---------|-------|
+| 1 | 0.517 | 79.0% | 70.9% | 0.689 | — |
+| 5 | 0.274 | 89.3% | 75.8% | 0.724 | — |
+| **15** | **0.192** | **92.5%** | **76.4%** | **0.7265** | **Best** |
+| 30 | 0.143 | 94.4% | 72.7% | 0.713 | Early stop fired |
+
+Early stopped at epoch 30 (patience=15, best at epoch 15).
+
+**Best model:** `outputs/execution-output/inception_posPool_nb32_d6_sfull_ep100_bs512/model.pt`
+
+Per-class F1 vs Stage 6 (MOMENT hybrid pool):
+
+| Class | Stage 6 (MOMENT) | Stage 8 (InceptionTime) | Delta |
+|-------|-----------------|-----------------------|-------|
+| Still | 0.84 | **0.87** | +0.03 |
+| Walking | **0.89** | 0.88 | -0.01 |
+| Run | 0.64 | 0.48 | -0.16 |
+| Bike | 0.65 | **0.84** | +0.19 |
+| Car | 0.74 | **0.80** | +0.06 |
+| Bus | 0.53 | **0.76** | +0.23 |
+| Train | 0.65 | 0.63 | -0.02 |
+| Metro | 0.64 | 0.56 | -0.08 |
+| **Macro-F1** | **0.6970** | **0.7265** | **+0.0295** |
+
+Key findings:
+- InceptionTime beats MOMENT hybrid pool by +2.95pp with 492K vs 341M params
+- Big wins on Bus (+23pp) and Bike (+19pp) where multi-scale temporal patterns dominate
+- Run (-16pp) and Metro (-8pp) regressions: rare class hurt by position-mixing diluting short-burst patterns
+- 4× faster to train (272s/epoch) than MOMENT extraction (90 min/position)
+- Fully submittable: custom architecture, no frozen FM constraint
+
+---
+
+## Stage 9 — Ensemble (Planned)
+
+- Stack: XGB (stat features) + InceptionTime + MOMENT head
+- Temperature scaling for calibrated probabilities
+- Test-time augmentation (TTA): predict on multiple augmented copies, average
+
+---
+
+## Stage 6 — Multi-Position Ensemble (Original Plan, Superseded by Stage 8)
 
 - Train a separate best-performing head for each position
 - At test time, average probabilities across positions (requires per-position test split -- check future challenge data releases)
@@ -609,7 +742,7 @@ it is not on the critical path and has been deferred.
 
 ---
 
-## Stage 7 — Submission
+## Stage 10 — Submission
 
 - `scripts/generate_submission.py` (implemented)
 - Format: 92 726 lines, each with 500 comma-separated integers (1-8)
@@ -620,13 +753,14 @@ it is not on the critical path and has been deferred.
 | File | Model | Val Macro-F1 | Notes |
 |------|-------|-------------|-------|
 | `FeatureFlyers_xgb_Bag_full.txt` | XGBoost Bag only | 0.6324 | Baseline submission |
-| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 pos) | 0.6389 | Prior best submission |
-| `FeatureFlyers_foundation_hybrid_smoke.txt` | MOMENT+stat hybrid Bag 20k — 1 000 lines | 0.7340 | Smoke test ✓ (1000 lines × 500 fields × 1–8) |
-| `FeatureFlyers_foundation_statonly_pool_full.txt` | Stat-only pool (all 4 pos) | **0.6481** | ✓ Generated (92 726 lines × 500 fields × 1–8) |
-| `FeatureFlyers_foundation_hybrid_pool_full.txt` | MOMENT+stat hybrid pool full | *pending GPU* | Best expected; blocked on GPU |
+| `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 pos) | 0.6389 | Submitted |
+| `FeatureFlyers_foundation_hybrid_smoke.txt` | MOMENT+stat hybrid Bag 20k — 1 000 lines | 0.7340 | Smoke test ✓ |
+| `FeatureFlyers_foundation_statonly_pool_full.txt` | Stat-only pool (all 4 pos) | 0.6481 | ✓ Generated |
+| `FeatureFlyers_foundation_hybrid_pool_full.txt` | MOMENT+stat hybrid pool full (Stage 6) | **0.6970** | ✓ Generated (2026-06-20) |
+| `FeatureFlyers_inception_pool_full.txt` | InceptionTime pool full (Stage 8) | **0.7265** | Pending — best candidate |
 
-**Current best model (validation):** MOMENT hybrid Bag 20k, macro-F1=**0.7340** (+9.51pp over XGB pool baseline)  
-**Current submission target:** `FeatureFlyers_foundation_statonly_pool_full.txt` (CPU-viable, val F1=0.6481, generated ✓)
+**Current best model (validation):** InceptionTime pool full, macro-F1=**0.7265**  
+**Current best submission target:** Generate InceptionTime test predictions (Stage 8 model saved at `inception_posPool_nb32_d6_sfull_ep100_bs512/model.pt`)
 
 ---
 

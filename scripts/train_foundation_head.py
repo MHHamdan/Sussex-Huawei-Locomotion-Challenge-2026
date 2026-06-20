@@ -445,6 +445,7 @@ def _train_sklearn_head(
     X_val: np.ndarray,
     y_val: np.ndarray,
     seed: int,
+    xgb_device: str = "cpu",
 ) -> tuple[object, float, float]:
     from sklearn.metrics import f1_score
 
@@ -463,7 +464,7 @@ def _train_sklearn_head(
             use_label_encoder=False,
             eval_metric="mlogloss",
             tree_method="hist",
-            device="cuda",
+            device=xgb_device,
             n_jobs=-1,
             random_state=seed,
             verbosity=1,
@@ -784,6 +785,8 @@ def main() -> None:
     # --- misc ---
     parser.add_argument("--seed",           type=int,   default=42)
     parser.add_argument("--device",         default="cuda")
+    parser.add_argument("--xgb-device",     default="cpu",
+                        help="Device for XGBoost fitting (default: cpu to avoid GPU OOM on large datasets)")
     parser.add_argument("--output-dir",     type=Path,  default=DEFAULT_OUTD)
     parser.add_argument("--force-extract",  action="store_true",
                         help="Re-run embedding extraction even if cache exists")
@@ -1134,7 +1137,8 @@ def main() -> None:
     elif args.head in SKLEARN_HEADS:
         from sklearn.metrics import f1_score, classification_report
         sklearn_model, best_f1, best_acc = _train_sklearn_head(
-            args.head, X_tr, y_tr, X_va, y_va, args.seed)
+            args.head, X_tr, y_tr, X_va, y_va, args.seed,
+            xgb_device=args.xgb_device)
         total_time = time.time() - t_train
 
         final_preds  = sklearn_model.predict(X_va)
