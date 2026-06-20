@@ -103,6 +103,7 @@ logs/
 *.log
 
 # Notebook temporary files
+notebooks/*
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 
