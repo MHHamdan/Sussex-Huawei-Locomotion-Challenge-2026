@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES=2 python -u scripts/run_stage9_ensemble.py \\
 # Generate test submission after val calibration:
 CUDA_VISIBLE_DEVICES=2 python -u scripts/run_stage9_ensemble.py \\
     --tta-n 5 --device cuda:0 --predict-test \\
-    --output outputs/execution-output/submissions/FeatureFlyers_ensemble_s9.txt \\
+    --output outputs/execution-output/submissions/FeatureFlyers_ensemble_s9_tta5.txt \\
     2>&1 | tee outputs/execution-output/stage9_ensemble_test.log
 
 Expected runtimes (GPU 2, batch=512, TTA n=5)
@@ -245,7 +245,7 @@ def main() -> None:
     parser.add_argument("--predict-test",   action="store_true",
                         help="After val calibration, run inference on test set")
     parser.add_argument("--output", type=Path,
-                        default=OUT_DIR / "submissions" / "FeatureFlyers_ensemble_s9.txt")
+                        default=OUT_DIR / "submissions" / "FeatureFlyers_ensemble_s9_tta5.txt")
     args = parser.parse_args()
 
     import torch
