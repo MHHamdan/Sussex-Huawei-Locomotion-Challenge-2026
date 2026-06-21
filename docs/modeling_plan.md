@@ -652,7 +652,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/train_stage7_lor
 
 | Run | N_train | Epochs | Best Macro-F1 | Accuracy | Notes |
 |-----|---------|--------|--------------|---------|-------|
-| LoRA r=8 α=16 blocks=4 | 80 000 | running | pending | pending | GPU 1, ~100% util |
+| LoRA r=8 α=16 blocks=4 | 80 000 | running (ep1 done) | 0.7035 (ep1) | 71.2% | GPU 1, 9516s/epoch |
 
 ---
 

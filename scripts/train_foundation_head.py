@@ -130,6 +130,29 @@ SKLEARN_HEADS = {"xgb", "logistic"}
 
 
 # ---------------------------------------------------------------------------
+# Class-balanced stratified resampling
+# ---------------------------------------------------------------------------
+
+def _stratify_balanced(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_per_class: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subsample X/y to at most n_per_class examples per class, then shuffle."""
+    rng = np.random.default_rng(seed)
+    keep: list[np.ndarray] = []
+    for cls in range(N_CLASSES):
+        idx = np.where(y == cls)[0]
+        if len(idx) > n_per_class:
+            idx = rng.choice(idx, n_per_class, replace=False)
+        keep.append(idx)
+    perm = np.concatenate(keep)
+    rng.shuffle(perm)
+    return X[perm], y[perm]
+
+
+# ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
 
@@ -790,6 +813,9 @@ def main() -> None:
     parser.add_argument("--output-dir",     type=Path,  default=DEFAULT_OUTD)
     parser.add_argument("--force-extract",  action="store_true",
                         help="Re-run embedding extraction even if cache exists")
+    parser.add_argument("--stratify-per-class", type=int, default=None,
+                        help="After loading all features, cap each class at N samples. "
+                             "Fixes pool-fusion class imbalance without re-extracting embeddings.")
     # --- prediction mode ---
     parser.add_argument("--predict-test",   action="store_true",
                         help="Prediction mode: load artifact, predict test set, "
@@ -860,18 +886,19 @@ def main() -> None:
     hyb_tag  = "_hybrid" if args.hybrid_stat_features else ""
     so_tag   = "_statonly" if args.stat_only          else ""
     pos_tag  = "Pool" if args.fusion == "pool" else args.position
+    strat_tag = f"_strat{args.stratify_per_class}" if args.stratify_per_class else ""
 
     encoder_tag = "stat" if args.stat_only else args.encoder
     run_name = (
         f"foundation_{encoder_tag}_pos{pos_tag}"
         f"_{args.embed_strategy}_norm{norm_tag}{mag_tag}{dlt_tag}"
-        f"_{args.head}{hyb_tag}{so_tag}_s{lim_str}"
+        f"_{args.head}{hyb_tag}{so_tag}_s{lim_str}{strat_tag}"
         + (f"_ep{args.epochs}" if args.head in PYTORCH_HEADS else "")
     )
     if args.stat_only:
         run_name = (
             f"foundation_statonly_pos{pos_tag}"
-            f"_{args.head}{hyb_tag}_s{lim_str}"
+            f"_{args.head}{hyb_tag}_s{lim_str}{strat_tag}"
             + (f"_ep{args.epochs}" if args.head in PYTORCH_HEADS else "")
         )
 
@@ -1025,6 +1052,14 @@ def main() -> None:
                   + (9 + (3 if args.include_magnitude else 0)) * (1 if args.include_delta else 0))
     print(f"\nTraining set: {X_tr.shape}  "
           f"({time.time() - t_feat:.0f}s total)")
+
+    # Class-balanced resampling (fixes pool-fusion imbalance)
+    if args.stratify_per_class:
+        before_n = len(X_tr)
+        X_tr, y_tr = _stratify_balanced(X_tr, y_tr, args.stratify_per_class, args.seed)
+        dist = np.bincount(y_tr, minlength=N_CLASSES).tolist()
+        print(f"  [STRATIFY] {before_n:,} → {len(X_tr):,}  per-class cap={args.stratify_per_class:,}")
+        print(f"  class dist: {[f'{LABEL_MAP[i]}={n}' for i, n in enumerate(dist)]}")
 
     # ------------------------------------------------------------------
     # Build validation feature matrix (always Bag-only)
