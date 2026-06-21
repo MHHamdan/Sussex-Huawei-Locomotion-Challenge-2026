@@ -385,6 +385,12 @@ def main() -> None:
     print_ensemble_report(best_probs, y_val, LABEL_MAP,
                           title=f"Stage 9 Ensemble ({best_label})")
 
+    # Save val predictions for temporal-smoothing sweep (Stage 7b)
+    _val_preds_path = args.output.parent / "val_preds_ensemble.txt"
+    _val_preds_1based = best_probs.argmax(axis=1).astype(np.int64) + 1
+    write_submission(_val_preds_1based, _val_preds_path)
+    print(f"\nVal preds saved → {_val_preds_path}  (use with smooth_predictions.py --sweep)")
+
     # Summary table
     print(f"\n{'Model':<16}  {'Val F1':>8}  {'Val Acc':>8}")
     print("-" * 38)

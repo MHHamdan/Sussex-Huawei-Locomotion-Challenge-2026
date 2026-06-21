@@ -779,10 +779,10 @@ def main() -> None:
                              "(None = full dataset)")
     # --- encoder ---
     parser.add_argument("--encoder",        default="moment",
-                        choices=["moment", "fallback", "chronos", "uni2ts"])
+                        choices=["moment", "chronos2", "fallback", "uni2ts"])
     parser.add_argument("--embed-strategy", default="mean_pool",
-                        choices=["mean_pool", "last_patch", "sensorwise",
-                                 "flatten_patches"])
+                        choices=["mean_pool", "last_patch", "last_token",
+                                 "sensorwise", "flatten_patches"])
     # --- preprocessing ---
     parser.add_argument("--norm",           default="none",
                         choices=["none", "per-window", "channel-global", "train-stats"])
