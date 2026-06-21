@@ -178,6 +178,8 @@ def main() -> None:
                         help="Evaluate smoothed vs raw using --val-labels")
     parser.add_argument("--val-labels", type=Path, default=DEFAULT_VAL_LABELS,
                         help="Ground-truth validation labels .npz (for --eval)")
+    parser.add_argument("--force",      action="store_true",
+                        help="Write output even when shuffled-data guard fires")
     parser.add_argument("--sweep",      action="store_true",
                         help="Sweep window sizes 1,3,5,...,19 and print F1 table")
     args = parser.parse_args()
@@ -223,12 +225,38 @@ def main() -> None:
             print(f"{w:>4}  {f1:>9.4f}  {sign}{delta:>6.4f}  {run_str}")
         print()
 
+    # --- temporal-order warning (always shown when smoothing) ---
+    _is_eval = args.eval or args.sweep
+    if not _is_eval:
+        print(
+            "\nWARNING: Temporal smoothing assumes predictions are in recording "
+            "order (window i is adjacent in time to window i+1).\n"
+            "  SHL 2026 test data is shuffled — smoothing on the test submission "
+            "will corrupt labels rather than improve them.\n"
+            "  Use --eval / --sweep on validation predictions only."
+        )
+
     # --- single smooth run ---
     print(f"\nSmoothing with window={args.window} ...", flush=True)
     labels_smooth = _fast_majority_vote(labels_raw, args.window)
     changed = int((labels_smooth != labels_raw).sum())
+    change_rate = changed / len(labels_raw)
     print(f"  Changed {changed:,} / {len(labels_raw):,} predictions "
-          f"({changed / len(labels_raw) * 100:.1f}%)")
+          f"({change_rate * 100:.1f}%)")
+
+    # --- shuffled-data guard ---
+    _SHUFFLE_THRESHOLD = 0.50
+    if change_rate > _SHUFFLE_THRESHOLD:
+        print(
+            f"\nCRITICAL: {change_rate*100:.1f}% of predictions changed — this indicates "
+            f"rows are NOT in temporal order (shuffled data).\n"
+            f"  Ordered data typically changes ~10–15% of windows.\n"
+            f"  Writing this file would corrupt the submission. Aborting.\n"
+            f"  Use --force to override (only if you know rows are ordered)."
+        )
+        if not args.force:
+            sys.exit(1)
+        print("  --force set: writing anyway (you accepted the risk).\n")
 
     if y_true is not None:
         f1_sm = _macro_f1(y_true, labels_smooth)
