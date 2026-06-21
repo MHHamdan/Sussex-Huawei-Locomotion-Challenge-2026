@@ -876,6 +876,50 @@ Do not install both in strict production environments.
 
 ---
 
+## Stage 11 — Final Submission Audit & Reproducibility
+
+**Branch:** `feature/stage11-submission-audit-reproducibility`
+
+### Final Selection Summary
+
+| Category                   | Model / File                                        | Val Macro-F1 |
+|----------------------------|-----------------------------------------------------|:------------:|
+| Best individual model      | InceptionTime — pool full (Stage 8)                 | 0.7265       |
+| Best foundation/hybrid     | MOMENT hybrid XGB — Bag 20k (Stage 6)               | 0.7329       |
+| Best ensemble              | Stage 9 — 3-model ensemble (weight-optimised, TTA5) | **0.7833**   |
+| **Final submission**       | `FeatureFlyers_ensemble_s9_tta5.txt`                | **0.7833**   |
+
+### Why Smoothing Is Rejected
+
+Temporal smoothing (HMM, majority-vote sliding window) requires consecutive windows to
+share a meaningful temporal relationship. The SHL 2026 test set (`test/data` in HDF5)
+is a flat `(92726, 500, 9)` array with **no guaranteed temporal ordering** — rows are
+shuffled. Applying smoothing on this data would corrupt predictions by blending labels
+from unrelated windows. `scripts/smooth_predictions.py` includes a shuffle guard that
+flags temporal-order violations; for the final submission smoothing is explicitly
+disabled (`--no-smooth` or by not invoking `smooth_predictions.py`).
+
+### New Artefacts (Stage 11)
+
+| File                                   | Purpose                                      |
+|----------------------------------------|----------------------------------------------|
+| `scripts/verify_submission.py`         | Full-format submission verifier              |
+| `docs/final_submission_manifest.md`    | Run manifest with commands and parameters    |
+| `docs/reproducibility_commands.md`     | Step-by-step reproduction commands           |
+| `docs/results_summary.md`             | Per-model F1/Accuracy table for paper        |
+
+### What Remains for Paper Writing
+
+- Ablation: uniform vs. weight-optimised ensemble weights (Δ≈0.2–0.5 pp).
+- Ablation: TTA n=1 vs. n=5 contribution per model.
+- Per-class analysis: Run (4.3% train, F1=0.60) — augmentation strategies.
+- Stage 10 Chronos-2: complete 20k Bag and pool runs if time permits.
+- Wall-clock breakdown: data prep → feature cache → embedding cache → training → inference.
+- Consider submitting Stage 9 ensemble predictions to the SHL 2026 leaderboard before
+  the deadline; see `docs/final_submission_manifest.md` for the exact submission file.
+
+---
+
 ## Experiment Tracking
 
 All runs log to `outputs/<run_name>/`:

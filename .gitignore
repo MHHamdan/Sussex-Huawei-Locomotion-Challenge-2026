@@ -113,3 +113,15 @@ notebooks/.ipynb_checkpoints/
 # Local AI assistant instructions
 AGENTS.md
 CLAUDE.md
+
+# ============================================================
+# Stage 11 — explicit safety nets
+# ============================================================
+
+# Top-level submissions or embeddings directories (if ever created outside outputs/)
+submissions/
+embeddings/
+
+# Submission text files at the repo root or anywhere outside outputs/
+# (files inside outputs/ are already covered by outputs/* above)
+FeatureFlyers_*.txt
