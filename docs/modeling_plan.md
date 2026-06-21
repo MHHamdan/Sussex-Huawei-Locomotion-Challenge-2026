@@ -726,11 +726,123 @@ Key findings:
 
 ---
 
-## Stage 9 — Ensemble (Planned)
+## Stage 9 — 3-Model Ensemble (InceptionTime + IMUFormer + MOMENT-XGB)
 
-- Stack: XGB (stat features) + InceptionTime + MOMENT head
-- Temperature scaling for calibrated probabilities
-- Test-time augmentation (TTA): predict on multiple augmented copies, average
+**Val Macro-F1: 0.7833** (temperature-calibrated, weight-optimised)
+
+- Stack: InceptionTime (0.7265) + IMUFormer (0.7125) + MOMENT+stat XGB (0.7098)
+- Temperature scaling per model to align confidence scales
+- TTA n=5 (jitter + scale augmentation) for PyTorch models
+- Weight optimisation on val set via Nelder–Mead (per `scripts/run_stage9_ensemble.py`)
+
+---
+
+## Stage 10 — Chronos-2 / Chronos Foundation Hybrid (feature/stage10-chronos2-foundation-hybrid)
+
+**Goal:** Test Chronos time-series foundation model embeddings as an additional feature source,
+complementary to the existing MOMENT + stat hybrid approach.
+
+### Motivation
+
+- Stage 9 ensemble (0.7833) uses 3 models trained over several GPU-days.
+- MOMENT hybrid pool was limited to 0.6970 due to slower 341M-param extraction.
+- Chronos (T5-small, 60M params, fast extraction) could offer a lighter-weight FM alternative.
+- If Chronos embeddings add unique signal, they could improve the Stage 9 ensemble as a 4th member.
+
+### Implementation — `src/featureflyers_shl/models/foundation.py`
+
+New class: `Chronos2Encoder`
+
+| Field | Value |
+|-------|-------|
+| Package | `chronos-forecasting==2.3.0` |
+| Model | `amazon/chronos-t5-small` (Chronos v1, publicly available) |
+| Architecture | T5-small encoder, d_model=512 |
+| Mode | Per-channel fallback (native Chronos-2 multivariate not yet publicly released) |
+| embed_dim | 512 |
+
+**Native multivariate mode (reserved):**  
+`Chronos2Pipeline` from `chronos-forecasting v2` supports `(B, n_variates, T)` input natively,
+sharing information across channels via group self-attention. The required model
+(`amazon/chronos-t5-small-r2` or equivalent) was not publicly available at time of testing.
+`Chronos2Encoder` will auto-detect and use native mode if such a model is loaded — no code change
+needed. The default `model_name` parameter falls back to the per-channel path.
+
+**Per-channel fallback (active):**  
+Each of 9 IMU channels processed independently through `ChronosPipeline.embed(x_c)` where
+`x_c = (B, T) = (B, 500)`. Output `(B, 501, 512)` per channel → mean pool → `(B, 512)`.
+All 9 channel embeddings averaged → final `(B, 512)` window embedding.
+
+This is clearly documented as fallback behavior. If future Chronos-2 models become available,
+the native path activates automatically.
+
+**Install:**
+```bash
+pip install chronos-forecasting
+```
+
+### Commands
+
+```bash
+# 1k smoke test
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 1000 \
+    --encoder chronos2 --norm per-window --embed-strategy mean_pool \
+    --head xgb --hybrid-stat-features --device cuda:0
+
+# 20k Bag run
+python scripts/train_foundation_head.py \
+    --position Bag --sample-limit 20000 \
+    --encoder chronos2 --norm per-window --embed-strategy mean_pool \
+    --head xgb --hybrid-stat-features --device cuda:0
+
+# Pool fusion (all 4 positions)
+# Note: --fusion pool automatically uses all 4 positions (no --positions flag needed)
+python scripts/train_foundation_head.py \
+    --fusion pool \
+    --encoder chronos2 --norm per-window --embed-strategy mean_pool \
+    --head xgb --hybrid-stat-features --device cuda:0
+
+# Smoke submission (1000 lines)
+python scripts/train_foundation_head.py \
+    --predict-test \
+    --model-path outputs/execution-output/<chronos2_run>/model.joblib \
+    --output submissions/FeatureFlyers_chronos2_hybrid_smoke.txt \
+    --limit 1000 --device cuda:0
+```
+
+### Results
+
+| Run | N_train | N_val | Macro-F1 | Accuracy | Feature dim | Status |
+|-----|---------|-------|----------|----------|-------------|--------|
+| 1k smoke (Bag, hybrid) | 1 000 | 1 000 | **0.6962** | 69.5% | 866 (512+354) | ✓ Done |
+| 20k Bag hybrid XGB | 20 000 | ~18 k | TBD | TBD | 866 | ▶ Running |
+| Pool all 4 positions | ~80 000 | 57 576 | TBD | TBD | 866 | Pending |
+
+### Comparison vs. other approaches (same 20k Bag, XGB head, hybrid features)
+
+| Model | Feature dim | Macro-F1 | Notes |
+|-------|-------------|----------|-------|
+| Stat-only XGB | 354 | 0.6804 | No FM |
+| MOMENT hybrid XGB | 1378 (1024+354) | **0.7329** | Best single 20k model |
+| Chronos2 hybrid XGB | 866 (512+354) | TBD (1k→0.6962) | Per-channel, smaller embed |
+
+### Extraction speed
+
+| Encoder | Windows | Time | Rate |
+|---------|---------|------|------|
+| MOMENT (FP16, batch=256) | 1 000 | ~12s | ~83 win/s |
+| Chronos v1 small (9-chan, batch=64) | 1 000 | ~70s | ~14 win/s |
+
+Chronos v1 per-channel is ~6× slower than MOMENT per window due to 9 sequential forward passes.
+For 20k windows: ~23 min extraction vs. ~4 min for MOMENT.
+
+### Package compatibility note
+
+Installing `chronos-forecasting==2.3.0` upgrades `transformers` and `huggingface-hub`, creating
+a conflict with `momentfm==0.1.4` (requires transformers==4.33.3, huggingface-hub==0.24.0).
+Both packages remain **importable** in the same environment despite the pip conflict warning.
+Do not install both in strict production environments.
 
 ---
 
