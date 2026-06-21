@@ -122,10 +122,22 @@ def _load_split(
             sample_limit=sample_limit,
             seed=seed, preload=True,
         )
-        print(f"  {pos}: {len(ds):,} windows  ({time.time()-t0:.0f}s)", flush=True)
-        X_parts.append(ds._X)
-        y_parts.append(ds._labels)
+        raw_X, raw_y = ds._X, ds._labels
         del ds
+
+        # Drop windows that contain NaN in the raw signal.
+        nan_mask = np.isnan(raw_X).any(axis=(1, 2))
+        if nan_mask.any():
+            n_bad = int(nan_mask.sum())
+            raw_X = raw_X[~nan_mask]
+            raw_y = raw_y[~nan_mask]
+            print(f"  {pos}: {len(raw_X):,} windows  ({time.time()-t0:.0f}s)  "
+                  f"[dropped {n_bad} NaN windows]", flush=True)
+        else:
+            print(f"  {pos}: {len(raw_X):,} windows  ({time.time()-t0:.0f}s)", flush=True)
+
+        X_parts.append(raw_X)
+        y_parts.append(raw_y)
 
     X = np.concatenate(X_parts, axis=0)   # (N, T, 9)
     y = np.concatenate(y_parts, axis=0)   # (N,) 0-based
@@ -172,14 +184,20 @@ def _train(
                            dtype=torch.float32, device=device)
     weights = weights / weights.sum() * N_CLASSES
 
+    # Sanity-check: NaN in Hips raw data was the known root cause of NaN loss.
+    assert not np.isnan(X_tr).any(), "X_tr contains NaN — check raw data NaN-drop step"
+    assert not np.isnan(X_va).any(), "X_va contains NaN"
+
     tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr).long())
     va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va).long())
-    kw = dict(num_workers=4, pin_memory=(device.type == "cuda"), persistent_workers=True)
+    # num_workers=0: avoids NaN from pin_memory+multiprocessing with large arrays in RAM.
+    # Data is already in RAM so worker overhead exceeds any I/O benefit.
+    kw = dict(num_workers=0, pin_memory=False)
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,  **kw)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, **kw)
 
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr * 0.01)
@@ -350,7 +368,7 @@ def main() -> None:
     # Training
     parser.add_argument("--epochs",        type=int,   default=60)
     parser.add_argument("--batch-size",    type=int,   default=512)
-    parser.add_argument("--lr",            type=float, default=1e-3)
+    parser.add_argument("--lr",            type=float, default=3e-4)
     parser.add_argument("--patience",      type=int,   default=12)
     parser.add_argument("--seed",          type=int,   default=42)
     parser.add_argument("--device",        default="cuda")
@@ -455,7 +473,7 @@ def main() -> None:
     import torch
     from torch.utils.data import DataLoader, TensorDataset
     va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va).long())
-    va_ld = DataLoader(va_ds, batch_size=EVAL_BS, num_workers=2)
+    va_ld = DataLoader(va_ds, batch_size=EVAL_BS, num_workers=0)
     pb, lb = [], []
     with torch.no_grad():
         for xb, yb in va_ld:
