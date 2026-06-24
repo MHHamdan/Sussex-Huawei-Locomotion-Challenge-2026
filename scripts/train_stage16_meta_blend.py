@@ -288,6 +288,18 @@ def load_moment_mlp_probs(run_dir: Path, split: str):
     return probs
 
 
+def load_precomputed_probs(run_dir: Path, split: str, tag: str):
+    """Generic loader for any stage that saves val_probs.npy / test_probs.npy."""
+    fname = "val_probs.npy" if split == "validation" else "test_probs.npy"
+    p = run_dir / fname
+    if not p.exists():
+        print(f"  [{tag:<13}] SKIP — missing {p}")
+        return None
+    probs = np.load(p).astype(np.float32)
+    print(f"  [{tag:<13}] {run_dir.name}  N={probs.shape[0]:,}")
+    return probs
+
+
 def load_moment_xgb_probs(run_dir, split):
     """XGB: predict from cached embeddings + stat features. No GPU needed."""
     import joblib
@@ -325,6 +337,10 @@ def main() -> None:
     parser.add_argument("--mvpf-dir",         type=Path, default=None)
     parser.add_argument("--moment-mlp-dir",   type=Path, default=None,
                         help="Stage 19 MOMENT-MLP run dir (contains val_probs.npy / test_probs.npy)")
+    parser.add_argument("--hmm-dir",          type=Path, default=None,
+                        help="Stage 20 HMM output dir (contains val_probs.npy / test_probs.npy)")
+    parser.add_argument("--bilstm-dir",       type=Path, default=None,
+                        help="Stage 20 BiLSTM output dir (contains val_probs.npy / test_probs.npy)")
     parser.add_argument("--lgbm-n-estimators",type=int,  default=500)
     parser.add_argument("--lgbm-lr",          type=float,default=0.05)
     parser.add_argument("--lgbm-num-leaves",  type=int,  default=63)
@@ -407,6 +423,18 @@ def main() -> None:
             val_probs_list.append(p)
             model_names.append("MOMENT-MLP")
 
+    if args.hmm_dir and args.hmm_dir.exists():
+        p = load_precomputed_probs(args.hmm_dir, "validation", "S20-HMM")
+        if p is not None:
+            val_probs_list.append(p)
+            model_names.append("S20-HMM")
+
+    if args.bilstm_dir and args.bilstm_dir.exists():
+        p = load_precomputed_probs(args.bilstm_dir, "validation", "S20-BiLSTM")
+        if p is not None:
+            val_probs_list.append(p)
+            model_names.append("S20-BiLSTM")
+
     if not val_probs_list:
         print("ERROR: no model directories provided or found.")
         sys.exit(1)
@@ -486,6 +514,9 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     import joblib as jl
     jl.dump(clf, save_dir / "lgbm_meta.joblib")
+    val_probs_ensemble = clf.predict_proba(X_meta).astype(np.float32)
+    np.save(save_dir / "val_probs.npy", val_probs_ensemble)
+    np.save(save_dir / "val_labels.npy", y_val.astype(np.int32))
 
     meta_cfg = dict(
         model_names=model_names, n_models=n_models,
@@ -545,6 +576,16 @@ def main() -> None:
         if p is not None:
             test_probs_list.append(p)
 
+    if args.hmm_dir and args.hmm_dir.exists() and "S20-HMM" in model_names:
+        p = load_precomputed_probs(args.hmm_dir, "test", "S20-HMM")
+        if p is not None:
+            test_probs_list.append(p)
+
+    if args.bilstm_dir and args.bilstm_dir.exists() and "S20-BiLSTM" in model_names:
+        p = load_precomputed_probs(args.bilstm_dir, "test", "S20-BiLSTM")
+        if p is not None:
+            test_probs_list.append(p)
+
     # If some models missing on test (e.g. XGB test embeddings absent), use remaining
     X_test_meta = np.hstack(test_probs_list[:len(test_probs_list)])
     if X_test_meta.shape[1] != X_meta.shape[1]:
@@ -553,7 +594,9 @@ def main() -> None:
         avg_probs = np.mean(test_probs_list, axis=0)
         preds_1based = avg_probs.argmax(1).astype(np.int64) + 1
     else:
-        preds_0based  = clf.predict(X_test_meta)
+        test_probs_ensemble = clf.predict_proba(X_test_meta).astype(np.float32)
+        np.save(save_dir / "test_probs.npy", test_probs_ensemble)
+        preds_0based  = test_probs_ensemble.argmax(1)
         preds_1based  = preds_0based.astype(np.int64) + 1
 
     from collections import Counter
