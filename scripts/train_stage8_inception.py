@@ -6,14 +6,34 @@ Pool fusion: Bag + Hand + Hips + Torso stacked as independent training samples.
 Validation: Bag-only (57 576 windows) for fair comparison with prior stages.
 Test: single mixed-position array — compatible with pool models.
 
+Stage 12 additions
+------------------
+  --loss ce|focal         Loss function (default: ce)
+  --focal-gamma FLOAT     Focal loss γ (default 2.0; ignored when --loss ce)
+  --class-weights none|balanced
+                          Apply inverse-frequency alpha weights to the loss.
+                          'balanced' = inverse class frequency (normalised).
+                          'none'     = uniform (no per-class weighting).
+  --label-smoothing FLOAT CE/focal label smoothing ε (default 0.0)
+  --sampler random|balanced
+                          Training DataLoader sampling strategy.
+                          'random'   = standard shuffle (default).
+                          'balanced' = WeightedRandomSampler by class frequency,
+                                       so each class appears ~equally per epoch.
+
 Usage
 -----
 # Smoke test
 python scripts/train_stage8_inception.py --sample-limit 5000 --epochs 3 --device cuda:0
 
-# Full run (Stage 8)
-python scripts/train_stage8_inception.py --epochs 100 --patience 15 --device cuda:0 \\
-    2>&1 | tee outputs/execution-output/stage8_inception_pool_full.log
+# Stage 8 original (class-weighted CE, random sampler)
+python scripts/train_stage8_inception.py --epochs 100 --patience 15 --device cuda:0
+
+# Stage 12 — focal + balanced sampler
+python scripts/train_stage8_inception.py \\
+    --loss focal --focal-gamma 2.0 --sampler balanced \\
+    --class-weights none --epochs 100 --patience 15 --device cuda:0 \\
+    2>&1 | tee outputs/execution-output/logs/stage12_focal_balanced.log
 """
 
 from __future__ import annotations
@@ -106,33 +126,46 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--hdf5-path",    type=Path, default=HDF5_PATH)
-    parser.add_argument("--sample-limit", type=int,   default=None,
+    parser.add_argument("--hdf5-path",       type=Path,  default=HDF5_PATH)
+    parser.add_argument("--sample-limit",    type=int,   default=None,
                         help="Stratified window limit per position per split (None=full)")
-    parser.add_argument("--epochs",       type=int,   default=100)
-    parser.add_argument("--batch-size",   type=int,   default=512)
-    parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--dropout",      type=float, default=0.3)
-    parser.add_argument("--nb-filters",   type=int,   default=32,
+    parser.add_argument("--epochs",          type=int,   default=100)
+    parser.add_argument("--batch-size",      type=int,   default=512)
+    parser.add_argument("--lr",              type=float, default=1e-3)
+    parser.add_argument("--dropout",         type=float, default=0.3)
+    parser.add_argument("--nb-filters",      type=int,   default=32,
                         help="Filters per branch in each inception module")
-    parser.add_argument("--depth",        type=int,   default=6,
+    parser.add_argument("--depth",           type=int,   default=6,
                         help="Number of inception modules (must be multiple of 3)")
-    parser.add_argument("--bottleneck",   type=int,   default=32)
-    parser.add_argument("--patience",     type=int,   default=15,
+    parser.add_argument("--bottleneck",      type=int,   default=32)
+    parser.add_argument("--patience",        type=int,   default=15,
                         help="Early stopping patience (0=disabled)")
-    parser.add_argument("--seed",         type=int,   default=42)
-    parser.add_argument("--device",       default="cuda:0")
-    parser.add_argument("--num-workers",  type=int,   default=4)
-    parser.add_argument("--output-dir",   type=Path,  default=DEFAULT_OUTD)
+    parser.add_argument("--seed",            type=int,   default=42)
+    parser.add_argument("--device",          default="cuda:0")
+    parser.add_argument("--num-workers",     type=int,   default=4)
+    parser.add_argument("--output-dir",      type=Path,  default=DEFAULT_OUTD)
+    # --- Stage 12: loss / sampling ---
+    parser.add_argument("--loss",            default="ce", choices=["ce", "focal"],
+                        help="Loss function: 'ce' = CrossEntropy, 'focal' = Focal loss")
+    parser.add_argument("--focal-gamma",     type=float, default=2.0,
+                        help="Focal loss focusing parameter γ (ignored when --loss ce)")
+    parser.add_argument("--class-weights",   default="none", choices=["none", "balanced"],
+                        help="Per-class alpha weight in loss: 'balanced'=inverse-frequency")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="Label smoothing ε for CE/focal (0=off, 0.1=typical)")
+    parser.add_argument("--sampler",         default="random", choices=["random", "balanced"],
+                        help="Training sampler: 'random'=shuffle, "
+                             "'balanced'=WeightedRandomSampler (equal class frequency)")
     args = parser.parse_args()
 
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, ConcatDataset
+    from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
     from sklearn.metrics import classification_report, confusion_matrix
 
     from featureflyers_shl.data.dataset    import SHLWindowDataset
     from featureflyers_shl.models.inception import InceptionTime
+    from featureflyers_shl.training.losses  import build_criterion
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -143,23 +176,30 @@ def main() -> None:
     use_amp = device.type == "cuda"
     lim_str = str(args.sample_limit) if args.sample_limit else "full"
 
+    # Build a descriptive run name that encodes all Stage 12 settings
+    loss_tag    = f"focal_g{args.focal_gamma}" if args.loss == "focal" else "ce"
+    sampler_tag = "_balsampler" if args.sampler == "balanced" else ""
+    cw_tag      = "_cwbal" if args.class_weights == "balanced" else ""
+    ls_tag      = f"_ls{args.label_smoothing}" if args.label_smoothing > 0 else ""
     run_name = (f"inception_posPool_nb{args.nb_filters}_d{args.depth}"
-                f"_s{lim_str}_ep{args.epochs}_bs{args.batch_size}")
+                f"_s{lim_str}_{loss_tag}{sampler_tag}{cw_tag}{ls_tag}"
+                f"_ep{args.epochs}_bs{args.batch_size}")
     run_dir  = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nStage 8 — InceptionTime pool fusion")
-    print(f"  device     : {device}  (AMP={'on' if use_amp else 'off'})")
-    print(f"  positions  : {POSITIONS} (pool — stacked as independent samples)")
-    print(f"  nb_filters : {args.nb_filters}  depth={args.depth}  bottleneck={args.bottleneck}")
-    print(f"  epochs     : {args.epochs}  patience={args.patience}")
-    print(f"  output     : {run_dir.relative_to(REPO_ROOT)}\n")
+    print(f"\nStage 8/12 — InceptionTime pool fusion")
+    print(f"  device        : {device}  (AMP={'on' if use_amp else 'off'})")
+    print(f"  positions     : {POSITIONS} (pool — stacked as independent samples)")
+    print(f"  nb_filters    : {args.nb_filters}  depth={args.depth}  bottleneck={args.bottleneck}")
+    print(f"  epochs        : {args.epochs}  patience={args.patience}")
+    print(f"  loss          : {args.loss}"
+          + (f"  gamma={args.focal_gamma}" if args.loss == "focal" else ""))
+    print(f"  class-weights : {args.class_weights}")
+    print(f"  label-smooth  : {args.label_smoothing}")
+    print(f"  sampler       : {args.sampler}")
+    print(f"  output        : {run_dir.relative_to(REPO_ROOT)}\n")
 
-    # ---- preload all windows into RAM via SHLWindowDataset(preload=True) ----
-    # Default (preload=None, sample_limit=None) does lazy HDF5 reads — slow for
-    # random DataLoader access. preload=True does one sequential HDF5 read per
-    # position at init and keeps everything in RAM.
-    # 4 positions × ~392K × 9 × 500 × float32 ≈ 28 GB — fits in 64 GB RAM.
+    # ---- preload all windows into RAM ----
     print("Preloading train windows into RAM …")
     t0 = time.time()
     train_datasets = [
@@ -171,24 +211,54 @@ def main() -> None:
         print(f"  {pos}: {len(ds):,} windows", flush=True)
 
     print("Preloading val windows into RAM …")
-    ds_val  = SHLWindowDataset(args.hdf5_path, split="validation", position="Bag",
-                               sample_limit=None, seed=args.seed + 1, preload=True)
+    ds_val   = SHLWindowDataset(args.hdf5_path, split="validation", position="Bag",
+                                sample_limit=None, seed=args.seed + 1, preload=True)
     ds_train = ConcatDataset(train_datasets)
-    n_train  = len(ds_train)
+
     print(f"  Bag val: {len(ds_val):,} windows  ({time.time()-t0:.1f}s total)\n")
 
-    # Class weights from training labels
-    counts = sum(ds.class_counts().astype(np.float64) for ds in train_datasets)
-    weights = torch.tensor(
-        (counts.sum() / (N_CLASSES * np.where(counts > 0, counts, 1.0))).astype(np.float32),
+    # Aggregate class counts across all position datasets
+    all_labels = np.concatenate([ds._labels for ds in train_datasets])
+    counts_np  = np.bincount(all_labels, minlength=N_CLASSES).astype(np.float64)
+    counts_t   = torch.from_numpy(counts_np).float()
+
+    print("Training class distribution:")
+    total_n = int(counts_np.sum())
+    for i, (name, cnt) in enumerate(zip(LABEL_MAP.values(), counts_np)):
+        pct = 100.0 * cnt / total_n
+        bar = "#" * max(1, int(pct / 2))
+        print(f"  [{i}] {name:<10} : {int(cnt):>9,}  ({pct:5.1f}%)  {bar}")
+    print()
+
+    # ---- loss ----
+    criterion = build_criterion(
+        loss_type=args.loss,
+        class_weights=args.class_weights,
+        counts=counts_t,
+        n_classes=N_CLASSES,
+        focal_gamma=args.focal_gamma,
+        label_smoothing=args.label_smoothing,
         device=device,
     )
+    print(f"Criterion : {criterion}\n")
 
-    # num_workers=0: TensorDataset is already in RAM, workers only add IPC overhead
+    # ---- sampler / DataLoader ----
     loader_kw = dict(batch_size=args.batch_size, num_workers=0,
                      pin_memory=(device.type == "cuda"))
-    train_loader = DataLoader(ds_train, shuffle=True,  **loader_kw)
-    val_loader   = DataLoader(ds_val,   shuffle=False, **loader_kw)
+
+    if args.sampler == "balanced":
+        inv_freq   = 1.0 / np.where(counts_np > 0, counts_np, 1.0)
+        sample_w   = torch.from_numpy(inv_freq[all_labels].astype(np.float32))
+        sampler    = WeightedRandomSampler(
+            weights=sample_w, num_samples=len(ds_train), replacement=True)
+        train_loader = DataLoader(ds_train, sampler=sampler, **loader_kw)
+        print(f"Sampler   : WeightedRandomSampler  (balanced — ~equal class freq per epoch)")
+    else:
+        train_loader = DataLoader(ds_train, shuffle=True, **loader_kw)
+        print(f"Sampler   : random shuffle")
+
+    val_loader = DataLoader(ds_val, shuffle=False, **loader_kw)
+    print()
 
     # ---- model ----
     model = InceptionTime(
@@ -199,7 +269,6 @@ def main() -> None:
     n_params = InceptionTime.n_params(model)
     print(f"Model   : InceptionTime  params={n_params:,}\n")
 
-    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
@@ -282,6 +351,10 @@ def main() -> None:
         n_params=n_params, epochs=args.epochs, batch_size=args.batch_size,
         lr=args.lr, dropout=args.dropout, patience=args.patience,
         sample_limit=args.sample_limit, seed=args.seed, device=str(device),
+        loss=args.loss, focal_gamma=args.focal_gamma,
+        class_weights=args.class_weights, label_smoothing=args.label_smoothing,
+        sampler=args.sampler,
+        best_f1=round(final_f1, 4),
     )
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
 

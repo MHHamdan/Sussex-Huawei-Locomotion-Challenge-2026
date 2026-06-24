@@ -6,9 +6,11 @@
 |------|-------|-------------|-------------|--------|
 | `FeatureFlyers_xgb_pool_full.txt` | XGBoost pool (all 4 positions) | 0.6389 | 68.4% | Submitted |
 | `FeatureFlyers_foundation_hybrid_pool_full.txt` | MOMENT+stat hybrid pool full | **0.6970** | 73.0% | Generated (Stage 6) |
+| `FeatureFlyers_ensemble_s12_tta5.txt` | Stage 12 ensemble (InceptionTime focal+balanced + IMUFormer focal+balanced + MOMENT-XGB), TTA n=5 | **0.8114** | **80.2%** | Generated (Stage 12) ✓ |
+| `FeatureFlyers_blend_s16_6model.txt` | Stage 16 7-model LightGBM meta-blend (InceptionTime + IMUFormer + MOMENT-XGB + SpectrogramCNN + ResNet1D + MVPF v2 + MOMENT-MLP) | **0.9566** | **95.0%** | **Submitted** (Stage 19) ✓ |
 
-Best **model** (not yet submitted): InceptionTime pool full — val Macro-F1=**0.7265**, Accuracy=76.4% (Stage 8).  
-Measured on Bag-only validation (57 576 windows).
+Best **model**: Stage 16 7-model meta-blend — val Macro-F1=**0.9566**, Accuracy=95.0%.  
+Submission file: `outputs/execution-output/submissions/FeatureFlyers_blend_s16_6model.txt`
 
 ---
 
@@ -813,19 +815,21 @@ python scripts/train_foundation_head.py \
 
 ### Results
 
-| Run | N_train | N_val | Macro-F1 | Accuracy | Feature dim | Status |
-|-----|---------|-------|----------|----------|-------------|--------|
-| 1k smoke (Bag, hybrid) | 1 000 | 1 000 | **0.6962** | 69.5% | 866 (512+354) | ✓ Done |
-| 20k Bag hybrid XGB | 20 000 | ~18 k | TBD | TBD | 866 | ▶ Running |
-| Pool all 4 positions | ~80 000 | 57 576 | TBD | TBD | 866 | Pending |
+| Run | N_train | Macro-F1 | Accuracy | Feature dim | Status |
+|-----|---------|----------|----------|-------------|--------|
+| 1k smoke (Bag, hybrid) | 1 000 | 0.6962 | 69.5% | 866 (512+354) | ✓ Done |
+| 20k Bag hybrid XGB | 20 000 | **0.7182** | 71.2% | 866 | ✓ Done |
+| Pool all 4 positions, 20k | 20 000 | 0.6958 | 71.1% | 866 | ✓ Done |
+
+**Finding:** Pool fusion *hurts* Chronos (0.7182 → 0.6958). Per-channel averaging already discards positional structure, so concatenating 4-position embeddings adds noise rather than signal. Chronos single-Bag (0.7182) trails MOMENT single-Bag (~0.7329) — T5-small (60M) vs T5-large (341M) matters. Chronos not added to ensemble.
 
 ### Comparison vs. other approaches (same 20k Bag, XGB head, hybrid features)
 
 | Model | Feature dim | Macro-F1 | Notes |
 |-------|-------------|----------|-------|
 | Stat-only XGB | 354 | 0.6804 | No FM |
-| MOMENT hybrid XGB | 1378 (1024+354) | **0.7329** | Best single 20k model |
-| Chronos2 hybrid XGB | 866 (512+354) | TBD (1k→0.6962) | Per-channel, smaller embed |
+| Chronos2 hybrid XGB | 866 (512+354) | 0.7182 | Per-channel, T5-small |
+| MOMENT hybrid XGB | 1378 (1024+354) | **0.7329** | Best single 20k model, T5-large |
 
 ### Extraction speed
 
@@ -917,6 +921,283 @@ disabled (`--no-smooth` or by not invoking `smooth_predictions.py`).
 - Wall-clock breakdown: data prep → feature cache → embedding cache → training → inference.
 - Consider submitting Stage 9 ensemble predictions to the SHL 2026 leaderboard before
   the deadline; see `docs/final_submission_manifest.md` for the exact submission file.
+
+---
+
+## Stage 12 — Focal Loss + Balanced Sampling (InceptionTime / IMUFormer)
+
+**Branch:** `feature/stage12-focal-balanced-training`  
+**Goal:** Improve weak-class F1 (Run=0.60, Metro=0.61, Train=0.67, Bus=0.79) via focal loss
+and class-balanced batch sampling. Target: push Stage 9 ensemble beyond 0.7833.
+
+### New source files
+
+| File | Purpose |
+|------|---------|
+| `src/featureflyers_shl/training/losses.py` | `FocalLoss` module + `build_criterion()` factory |
+| Updated `scripts/train_stage8_inception.py` | `--loss`, `--focal-gamma`, `--class-weights`, `--label-smoothing`, `--sampler` |
+| Updated `scripts/train_imu_former.py` | Same flags; `_train()` accepts pre-built criterion + balanced sampler |
+
+### Ablation design — 4 × InceptionTime (GPU parallel)
+
+| GPU | Experiment | Loss | Class-weights | Sampler | Run dir tag |
+|-----|-----------|------|--------------|---------|-------------|
+| 0 | Baseline/control | CE | none | random | `ce` |
+| 1 | Focal only | Focal γ=2 | none | random | `focal_g2.0` |
+| 2 | Balanced sampler only | CE | none | balanced | `ce_balsampler` |
+| 3 | Focal + balanced | Focal γ=2 | none | balanced | `focal_g2.0_balsampler` |
+
+All other hypers identical to Stage 8 best: `nb_filters=32, depth=6, epochs=100, patience=15, seed=42, pool`.
+
+### Launch commands (2026-06-21)
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u scripts/train_stage8_inception.py \
+    --device cuda:0 --loss ce --sampler random --class-weights none --seed 42 \
+    2>&1 | tee outputs/execution-output/logs/stage12_gpu0_inception_baseline.log &
+
+CUDA_VISIBLE_DEVICES=1 python -u scripts/train_stage8_inception.py \
+    --device cuda:0 --loss focal --focal-gamma 2.0 --sampler random --class-weights none --seed 42 \
+    2>&1 | tee outputs/execution-output/logs/stage12_gpu1_inception_focal.log &
+
+CUDA_VISIBLE_DEVICES=2 python -u scripts/train_stage8_inception.py \
+    --device cuda:0 --loss ce --sampler balanced --class-weights none --seed 42 \
+    2>&1 | tee outputs/execution-output/logs/stage12_gpu2_inception_balanced.log &
+
+CUDA_VISIBLE_DEVICES=3 python -u scripts/train_stage8_inception.py \
+    --device cuda:0 --loss focal --focal-gamma 2.0 --sampler balanced --class-weights none --seed 42 \
+    2>&1 | tee outputs/execution-output/logs/stage12_gpu3_inception_focal_balanced.log &
+```
+
+### Results — Batch 1 InceptionTime (completed 2026-06-21)
+
+Stage 8 original for reference: Macro-F1=**0.7265**, Run=0.48, Bus=0.76, Train=0.63, Metro=0.56
+
+| GPU | Experiment | Val Macro-F1 | Val Acc | Still F1 | Walk F1 | Run F1 | Bike F1 | Car F1 | Bus F1 | Train F1 | Metro F1 | Best Ep | Notes |
+|-----|-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---|
+| — | Stage 8 original (class-wt CE) | 0.7265 | 76.4% | — | — | 0.48 | — | — | 0.76 | 0.63 | 0.56 | 30 | Baseline reference |
+| 0 | CE, no weights, random | 0.7387 | ~75.3% | — | — | — | — | — | — | — | — | 16 | Partial† |
+| 1 | Focal γ=2, random | 0.7444 | ~75.0% | — | — | — | — | — | — | — | — | 22 | Partial† |
+| 2 | CE, balanced sampler | 0.7487 | 75.5% | — | — | **0.74** | — | — | 0.72 | 0.56 | 0.58 | 7 | Complete |
+| **3** | **Focal γ=2, balanced (rerun)** | **0.7726** | **75.5%** | **0.85** | **0.92** | **0.94** | **0.85** | **0.75** | **0.71** | **0.55** | **0.61** | **18** | **Complete** ✓ |
+
+† Jobs were killed at epoch 27 when stdout pipe broke; `model.pt` not saved. GPU 3 was rerun with `nohup` — full checkpoint saved.
+
+Artifact: `outputs/execution-output/inception_posPool_nb32_d6_sfull_focal_g2.0_balsampler_ep100_bs512/model.pt`
+
+#### Key findings
+
+1. **Balanced sampler is the primary driver.** CE + balanced (0.7487) beats CE baseline (0.7387) by +10 pp; focal + balanced (0.7726) beats focal only (0.7444) by +28 pp.
+2. **Run F1: 0.48 → 0.74** (+26 pp) with balanced sampler alone (GPU 2). The sampler forces equal class exposure per epoch, directly attacking the 4.3% Run under-representation.
+3. **Focal loss adds +3.9 pp** when combined with balanced sampler (0.7487 → 0.7726), and +0.6 pp with random sampler (0.7387 → 0.7444). Focal alone is a modest gain; focal + balanced is synergistic.
+4. **Trade-off:** balanced sampler hurts Train (0.63 → 0.56) and Bus (0.76 → 0.72) while massively boosting Run. This is the classic balanced-sampling bias-variance trade-off — acceptable given macro-F1 is the metric.
+5. **GPU 3 trajectory:** peaked at epoch 18 (0.7726), remained in 0.73–0.76 range through epoch 27. Best value unlikely to improve materially with more epochs.
+
+### Decision
+
+**Focal γ=2 + balanced sampler is the winner.** Next steps:
+1. **Re-run GPU 3 config as a full, properly-detached job** to save `model.pt` checkpoint for ensemble use.
+2. **Apply focal + balanced to IMUFormer** (Batch 2).
+3. Use `nohup ... > logfile 2>&1 &` for all future long-running jobs to avoid pipe-break issue.
+
+### Batch 2 — IMUFormer (completed 2026-06-21)
+
+Applied focal γ=2 + balanced sampler (winning Batch 1 config) to IMUFormer.
+
+```bash
+# GPU 0 — IMUFormer focal+balanced (nohup, direct file redirect)
+CUDA_VISIBLE_DEVICES=0 nohup python -u scripts/train_imu_former.py \
+    --fusion pool --stratify-per-class 40000 --epochs 60 \
+    --loss focal --focal-gamma 2.0 --sampler balanced --class-weights none \
+    --seed 42 --device cuda:0 \
+    > outputs/execution-output/logs/stage12_gpu0_imuformer_focal_balanced.log 2>&1 &
+```
+
+| Model | Val Macro-F1 | Val Acc | Run F1 | Bus F1 | Train F1 | Metro F1 | Best Ep | Notes |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---|
+| Stage 8 baseline (class-wt CE, random) | 0.7125 | — | — | — | — | — | — | Reference |
+| **Focal γ=2 + balanced sampler** | **0.7210** | 72.2% | **0.77** | 0.64 | 0.56 | 0.54 | 32 | Stopped ep44 |
+
+Artifact: `outputs/execution-output/imuformer_d128tf2_posPool_sfull_strat40000_focal_g2.0_balsampler_nocw_ep60/`
+
+#### IMUFormer findings
+
+1. **Marginal gain (+0.0085).** Unlike InceptionTime (+0.0461 from Stage 8), IMUFormer benefits only slightly from focal+balanced.
+2. **Root cause — pre-stratified training pool.** IMUFormer already stratifies to 40k/class (320k total) before training, so balanced sampler sees an already near-uniform distribution; there is no imbalance left to correct at the batch level.
+3. **Fast memorization.** TrainAcc reaches 99.8% by ep44 (TrainLoss=0.0017) while val MacroF1 plateaus at 0.721. The small, resampled pool is memorized well before the 60-epoch budget.
+4. **Run F1 improved (→0.77)** but Bus/Train/Metro dipped vs Stage 8 — same balanced-sampler trade-off as InceptionTime.
+5. **Decision:** Use this checkpoint (0.7210) in the updated ensemble as it outperforms Stage 8 (0.7125).
+
+---
+
+---
+
+## Stage 13 — MiniRocket (Position Pool, Precomputed Kernels)
+
+**Val Macro-F1: 0.2711** (best epoch 32 of 60 — underfit)
+
+- Architecture: MiniRocket k=1000 dilations [1,4,16], position pool fusion
+- Training: focal γ=2, balanced sampler, batch 4096, precomputed kernel features
+- Artifact: `outputs/execution-output/minirocket_posPool_k1000_dil1-4-16_sfull_focal_g2.0_balsampler_ep60_bs4096_precomp/`
+- **Finding:** MiniRocket features (random convolutional kernels) lack sufficient expressiveness for multi-position IMU fusion with 8 fine-grained transport classes. Eliminated from ensemble.
+
+---
+
+## Stage 14 — Spectrogram CNN
+
+**Val Macro-F1: 0.7590** (best epoch 20 of 80)
+
+- Architecture: CNN on log-mel spectrogram (n_fft=64, hop=16), position pool fusion
+- Training: focal γ=2, balanced sampler, batch 256
+- Artifact: `outputs/execution-output/spectrogramcnn_posPool_nfft64_hop16_sfull_focal_g2.0_balsampler_ep80_bs256/`
+- **Finding:** Spectrogram CNN reaches 0.759 — competitive with InceptionTime (0.7726). Frequency-domain features capture periodic gait patterns well. Included in ensemble as 4th model.
+
+---
+
+## Stage 15 — ResNet1D (Deep Residual, Position Pool)
+
+**Val Macro-F1: 0.7740** (best epoch 35 of 100)
+
+- Architecture: ResNet1D f=64, position pool fusion, focal γ=2, balanced sampler
+- Training: batch 512, 100-epoch budget
+- Artifact: `outputs/execution-output/resnet1d_posPool_f64_sfull_focal_g2.0_balsampler_ep100_bs512/`
+- **Finding:** ResNet1D matches/slightly exceeds InceptionTime (0.7726 → 0.7740). Deep residual connections with position pooling are well-suited to IMU time series. Strongest single-position model to date. Included as 5th ensemble member.
+
+---
+
+## Stage 16 — LightGBM Meta-Blend (7-Model Ensemble)
+
+**Val Macro-F1: 0.9566** (hold-out 20% of val set) | **Full-val: 0.9913** (biased) | **Val Accuracy: 0.9503**
+
+Upgraded from 5-model (0.9438) to 7-model by adding MVPF v2 (Stage 18) and MOMENT-MLP (Stage 19).
+
+### Stack
+| Model | Val Macro-F1 | Role |
+|---|:---:|---|
+| InceptionTime | 0.7726 | Deep time-series |
+| IMUFormer | 0.7210 | Transformer on IMU windows |
+| MOMENT-XGB | 0.7098 | Foundation model embeddings + stat XGB |
+| SpectrogramCNN | 0.7590 | Frequency-domain CNN |
+| ResNet1D | 0.7740 | Deep residual time-series |
+| MVPF v2 | 0.7767 | 4-position cross-fusion transformer |
+| MOMENT-MLP | 0.7675 | MOMENT-1-large 4096-d MLP head |
+| **LightGBM meta-learner** | **0.9566** | Stacks 7×8=56 prob features |
+
+### Per-class F1 (holdout 20% of val, 11,516 windows)
+| Still | Walking | Run | Bike | Car | Bus | Train | Metro |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0.95 | 0.95 | 0.99 | 0.97 | 0.98 | 0.96 | 0.92 | 0.93 |
+
+### Key details
+- Meta-features: concatenated softmax probs from all 7 models → (N, 56) input to LightGBM
+- LightGBM: n_estimators=500, lr=0.05, num_leaves=63, early stopping at best_iteration=201
+- 80/20 train/eval split on val set for unbiased meta-learner estimate
+- Script: `scripts/train_stage16_meta_blend.py`
+- Artifacts: `outputs/execution-output/meta_blend_s16_lgbm_7models/`
+- Submission: `outputs/execution-output/submissions/FeatureFlyers_blend_s16_6model.txt` (92,726 lines)
+
+### Bug fix: MVPFv2 model dispatch
+`load_mvpf_probs()` now reads `cfg["model"]` and imports `MVPFv2` from `featureflyers_shl.models.mvpf_v2` when appropriate (FFN dim 4× vs 2× mismatch in v1 class).
+
+### Finding
+The +0.0128 gain from 5-model to 7-model ensemble (0.9438 → 0.9566) confirms MVPF v2 and MOMENT-MLP add orthogonal signal — particularly on Bus/Train/Metro which both models handle differently from CNN-based approaches. Train (0.92) and Metro (0.93) remain the weakest classes but improved substantially over the 5-model stack.
+
+---
+
+## Stage 17 — MVPF v1 (Multi-View Position Fusion)
+
+**Val Macro-F1: 0.6877** (best epoch 24 of 39, early-stopped)
+
+- Architecture: Shared ResNet1D encoder (3 stages) + GlobalAvgPool + CrossPositionTransformer (2 layers, 4 heads) + gated mean pool → classifier
+- Input: (B, 4, 9, 500) — all 4 sensor positions simultaneously
+- Training: jitter σ=0.05, position dropout p=0.25, focal γ=2, balanced sampler
+- Script: `scripts/train_stage17_mvpf.py`
+- **Finding:** Heavy overfitting (TrainAcc→99.8% by ep12, ValF1≤0.65 without aug) limited by insufficient augmentation. No IMU rotation aug → model memorises sensor orientation. Addressed in v2.
+
+---
+
+## Stage 18 — MVPF v2 (Rotation Aug + Magnitude Warp + SWA)
+
+**Val Macro-F1: 0.7767** (best epoch 9 of 80)
+
+### Architecture improvements over v1
+| Component | v1 | v2 |
+|---|---|---|
+| Temporal pooling | GlobalAvgPool | TemporalAttentionPool (learnable per-bin weights) |
+| Encoder depth | 3 stages | 4 stages (500→62 time bins) |
+| Cross-pos transformer | 2 layers, 4 heads | 3 layers, 8 heads |
+| Position fusion | Unconditional mean | Sigmoid-gated mean (learns position reliability) |
+| Head normalisation | None | LayerNorm before Linear |
+
+### Training
+- Augmentation: rotation aug (p=0.7, QR-batched) + magnitude warp (p=0.5) + jitter + position dropout
+- LR: 1e-4 → ReduceLROnPlateau → 3.13e-6 at ep80; warmup ep=1
+- SWA: epochs 50–80 (AveragedModel); final `update_bn()` pass
+- Epochs: 80 | Batch: 256 | Patience: 0 (run to completion)
+- Script: `scripts/train_stage18_mvpf_v2.py`
+- Artifact: `outputs/execution-output/mvpf_v2_4pos_fd256_bf64_h8tf3_sfull_focal_g2.0_balsampler_swa50_rotaug_ep80_bs256/`
+
+### Per-class F1 (best checkpoint, ep9)
+| Still | Walking | Run | Bike | Car | Bus | Train | Metro |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0.82 | 0.92 | 0.94 | 0.83 | 0.84 | 0.66 | 0.59 | 0.62 |
+
+### SWA outcome
+SWA model evaluated at F1=0.0429 — `update_bn()` corrupted batch-norm statistics when run over balanced-sampler batches (non-representative distribution). Base model (ep9, 0.7767) retained in `model.pt`.
+
+### Finding
+MVPF v2 reaches 0.7767 — competitive with ResNet1D (0.7740) using cross-position fusion. Bus/Train/Metro (the hard transport classes) remain the ceiling; cross-position interactions are not yet sufficient to fully disambiguate them. Added as 6th model in the Stage 16 meta-blend.
+
+---
+
+## Stage 19 — MOMENT-1-large MLP (4-Position Foundation Model)
+
+**Val Macro-F1: 0.7675** (best epoch 14 of 60) ✓ Complete
+
+### Architecture
+- **Encoder:** MOMENT-1-large (AutonLab, 341M params, flan-t5-large backbone, d_model=1024, 24 encoder layers) — frozen, fp16
+- **Embedding:** Each position window (9, 500) → pad to 512 → MOMENT encode with `reduction="mean"` → mean over patches → (1024,). Four positions concatenated → (4096,) feature vector per sample
+- **Head:** MLP: LayerNorm(4096) → Linear(4096→512) → GELU → Dropout(0.3) → LayerNorm(512) → Linear(512→128) → GELU → Dropout(0.3) → Linear(128→8)
+
+### Two-phase workflow
+```
+Phase A (--extract): GPU inference, save (N, 4, 1024) float16 .npz
+Phase B (--train): CPU MLP on cached 4096-d features
+```
+
+### Embedding cache (all complete ✓)
+| Split | Shape | Compressed size |
+|---|---|---|
+| Train | (392142, 4, 1024) float16 | 2.98 GB |
+| Validation | (57576, 4, 1024) float16 | 418 MB |
+| Test | (92726, 4, 1024) float16 | 173 MB |
+
+- Extraction speed: 4.51s/batch (batch=64) — GPU inference bottleneck; ~7.7h for train split
+- Script: `scripts/train_stage19_moment.py`
+- Embeddings: `outputs/execution-output/moment_embeddings/`
+
+### MLP training results
+| Epoch | Val Macro-F1 | Note |
+|---|---|---|
+| 14 | **0.7675** | Best (saved) |
+| 60 | 0.7528 | Final (LR cosine decay) |
+
+**Per-class F1 (best epoch 14):**
+| Still | Walking | Run | Bike | Car | Bus | Train | Metro |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0.85 | 0.92 | 0.93 | 0.88 | 0.79 | 0.65 | 0.54 | 0.59 |
+
+- Artifact: `outputs/execution-output/moment_large_mlp_ep60_lr1e-03_bs512/`
+- Probs: `val_probs.npy` (57576, 8), `test_probs.npy` (92726, 8)
+
+### Meta-blend integration
+`train_stage16_meta_blend.py` extended with `--moment-mlp-dir` arg and `load_moment_mlp_probs()` — loads pre-saved probs directly (no GPU at blend time). Contributes as 7th model in Stage 16 ensemble.
+
+### Engineering note: atomic npz save
+First extraction run was killed mid-write by a process sentinel, corrupting the zip central directory. Fixed by writing to `.tmp.npz` then `rename()` — now safe to interrupt at any point.
+
+### Finding
+MOMENT-1-large MLP (F1=0.7675) falls below the expected 0.79–0.83 range, likely because the 4096-d feature concatenation (4 identical-architecture position embeddings) provides limited additional cross-position signal over single-position baselines. The model is weakest on Train (0.54) and Metro (0.59) — exactly where transport confusion is hardest. As a 7th model in the LightGBM blend, it contributes complementary signal that pushes ensemble from 0.9438 → **0.9566**.
 
 ---
 

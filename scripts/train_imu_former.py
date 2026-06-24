@@ -67,7 +67,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 REPO_ROOT    = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -231,13 +231,12 @@ def _train(
     lr_patience: int = 5,
     lr_factor: float = 0.5,
     min_lr: float = 1e-5,
+    criterion: nn.Module | None = None,
+    use_balanced_sampler: bool = False,
 ) -> tuple[dict, float, float, list]:
     from sklearn.metrics import f1_score
 
     counts  = np.bincount(y_tr, minlength=N_CLASSES).astype(np.float32)
-    weights = torch.tensor(1.0 / np.where(counts > 0, counts, 1.0),
-                           dtype=torch.float32, device=device)
-    weights = weights / weights.sum() * N_CLASSES
 
     # NaN guard: Hips has 2 corrupt raw windows; _load_split drops them.
     # This assertion confirms the fix held before we allocate GPU memory.
@@ -249,11 +248,28 @@ def _train(
     # num_workers=0: avoids silent corruption from pin_memory+multiprocessing
     # on large in-RAM tensors; data is already in RAM so there is no I/O benefit.
     kw = dict(num_workers=0, pin_memory=False)
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,  **kw)
+
+    if use_balanced_sampler:
+        inv_freq = 1.0 / np.where(counts > 0, counts, 1.0)
+        sample_w = torch.from_numpy(inv_freq[y_tr].astype(np.float32))
+        sampler  = WeightedRandomSampler(sample_w, num_samples=len(y_tr), replacement=True)
+        tr_ld = DataLoader(tr_ds, batch_size=batch_size, sampler=sampler, **kw)
+        print(f"  Sampler : WeightedRandomSampler (balanced)", flush=True)
+    else:
+        tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, **kw)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, **kw)
 
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
+
+    # Use caller-supplied criterion if provided; otherwise fall back to
+    # the original inverse-frequency weighted CE (preserves backward compat).
+    if criterion is None:
+        weights   = torch.tensor(1.0 / np.where(counts > 0, counts, 1.0),
+                                 dtype=torch.float32, device=device)
+        weights   = weights / weights.sum() * N_CLASSES
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
+    else:
+        criterion = criterion.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     if scheduler_type == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -469,6 +485,17 @@ def main() -> None:
                         help="Lower bound of per-channel random scale (default 0.9).")
     parser.add_argument("--scale-max",          type=float, default=1.1,
                         help="Upper bound of per-channel random scale (default 1.1).")
+    # Stage 12: loss / sampling
+    parser.add_argument("--loss",               default="ce", choices=["ce", "focal"],
+                        help="Loss function: 'ce' = CrossEntropy, 'focal' = Focal loss")
+    parser.add_argument("--focal-gamma",        type=float, default=2.0,
+                        help="Focal loss γ (ignored when --loss ce)")
+    parser.add_argument("--class-weights",      default="balanced",
+                        choices=["none", "balanced"],
+                        help="Per-class alpha: 'balanced'=inverse-frequency (default), 'none'=off")
+    parser.add_argument("--sampler",            default="random", choices=["random", "balanced"],
+                        help="Training sampler: 'random'=shuffle (default), "
+                             "'balanced'=WeightedRandomSampler")
     # Prediction
     parser.add_argument("--predict-test",       action="store_true")
     parser.add_argument("--model-path",         type=Path,  default=None)
@@ -483,6 +510,7 @@ def main() -> None:
 
     from sklearn.metrics import classification_report, f1_score
     from featureflyers_shl.models.imu_former import build_imu_former
+    from featureflyers_shl.training.losses import build_criterion
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -508,6 +536,13 @@ def main() -> None:
         tags.append(f"ls{str(args.label_smoothing).replace('.', '')}")
     if args.dropout != 0.1:
         tags.append(f"do{str(args.dropout).replace('.', '')}")
+    # Stage 12 tags
+    if args.loss == "focal":
+        tags.append(f"focal_g{args.focal_gamma}")
+    if args.sampler == "balanced":
+        tags.append("balsampler")
+    if args.class_weights == "none":
+        tags.append("nocw")
     tag_str = ("_" + "_".join(tags)) if tags else ""
 
     run_name = (
@@ -534,6 +569,10 @@ def main() -> None:
              else f"  T_max={args.epochs}  min_lr={args.min_lr}"))
     print(f"  augment      : {aug_str}")
     print(f"  stratify     : {args.stratify_per_class or 'none'}")
+    print(f"  loss         : {args.loss}"
+          + (f"  gamma={args.focal_gamma}" if args.loss == "focal" else ""))
+    print(f"  class-weights: {args.class_weights}")
+    print(f"  sampler      : {args.sampler}")
     print(f"  device       : {device}")
     print(f"  output       : {run_dir.relative_to(REPO_ROOT)}\n")
 
@@ -571,6 +610,28 @@ def main() -> None:
     )
     print(f"Validation set: {X_va.shape}  ({time.time()-t0:.0f}s)")
 
+    # Build criterion (Stage 12: focal / class-weight control)
+    counts_np = np.bincount(y_tr, minlength=N_CLASSES).astype(np.float64)
+    criterion = build_criterion(
+        loss_type=args.loss,
+        class_weights=args.class_weights,
+        counts=torch.from_numpy(counts_np).float(),
+        n_classes=N_CLASSES,
+        focal_gamma=args.focal_gamma,
+        label_smoothing=args.label_smoothing,
+        device=device,
+    )
+    print(f"Criterion : {criterion}\n")
+
+    # Print training class distribution
+    total_tr = int(counts_np.sum())
+    print("Training class distribution:")
+    for i, (name, cnt) in enumerate(zip(LABEL_MAP.values(), counts_np)):
+        pct = 100.0 * cnt / total_tr
+        bar = "#" * max(1, int(pct / 2))
+        print(f"  [{i}] {name:<10} : {int(cnt):>9,}  ({pct:5.1f}%)  {bar}")
+    print()
+
     # Train
     t_train = time.time()
     best_state, best_f1, best_acc, history = _train(
@@ -590,6 +651,8 @@ def main() -> None:
         lr_patience=args.lr_patience,
         lr_factor=args.lr_factor,
         min_lr=args.min_lr,
+        criterion=criterion,
+        use_balanced_sampler=(args.sampler == "balanced"),
     )
     total_time = time.time() - t_train
 
@@ -639,6 +702,10 @@ def main() -> None:
         scale_min=args.scale_min,
         scale_max=args.scale_max,
         val_fusion=args.val_fusion,
+        loss=args.loss,
+        focal_gamma=args.focal_gamma,
+        class_weights=args.class_weights,
+        sampler=args.sampler,
     )
     torch.save(dict(model_state=best_state, config=config), run_dir / "best_model.pt")
 
