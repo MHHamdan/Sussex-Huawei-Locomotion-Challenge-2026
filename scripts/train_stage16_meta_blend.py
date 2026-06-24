@@ -423,6 +423,10 @@ def main() -> None:
             val_probs_list.append(p)
             model_names.append("MOMENT-MLP")
 
+    # Record count of unbiased base models before any stage20 probs are appended.
+    # Base models are trained on the HDF5 train split → their val probs are clean.
+    n_base_models = len(val_probs_list)
+
     if args.hmm_dir and args.hmm_dir.exists():
         p = load_precomputed_probs(args.hmm_dir, "validation", "S20-HMM")
         if p is not None:
@@ -517,6 +521,10 @@ def main() -> None:
     val_probs_ensemble = clf.predict_proba(X_meta).astype(np.float32)
     np.save(save_dir / "val_probs.npy", val_probs_ensemble)
     np.save(save_dir / "val_labels.npy", y_val.astype(np.int32))
+    # Unbiased base-model average — safe HMM input (no LightGBM feedback loop)
+    val_base_avg = np.mean(val_probs_list[:n_base_models], axis=0).astype(np.float32)
+    np.save(save_dir / "val_probs_base_avg.npy", val_base_avg)
+    print(f"  Saved val_probs_base_avg.npy  ({n_base_models} base models, unbiased)")
 
     meta_cfg = dict(
         model_names=model_names, n_models=n_models,
@@ -575,6 +583,11 @@ def main() -> None:
         p = load_moment_mlp_probs(args.moment_mlp_dir, "test")
         if p is not None:
             test_probs_list.append(p)
+
+    # Save unbiased base-model test average before appending stage20 probs
+    test_base_avg = np.mean(test_probs_list[:n_base_models], axis=0).astype(np.float32)
+    np.save(save_dir / "test_probs_base_avg.npy", test_base_avg)
+    print(f"  Saved test_probs_base_avg.npy  ({n_base_models} base models, unbiased)")
 
     if args.hmm_dir and args.hmm_dir.exists() and "S20-HMM" in model_names:
         p = load_precomputed_probs(args.hmm_dir, "test", "S20-HMM")
