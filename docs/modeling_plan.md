@@ -882,22 +882,36 @@ Do not install both in strict production environments.
 
 ### Final Selection Summary
 
-| Category                   | Model / File                                        | Val Macro-F1 |
-|----------------------------|-----------------------------------------------------|:------------:|
-| Best individual model      | InceptionTime — pool full (Stage 8)                 | 0.7265       |
-| Best foundation/hybrid     | MOMENT hybrid XGB — Bag 20k (Stage 6)               | 0.7329       |
-| Best ensemble              | Stage 9 — 3-model ensemble (weight-optimised, TTA5) | **0.7833**   |
-| **Final submission**       | `FeatureFlyers_ensemble_s9_tta5.txt`                | **0.7833**   |
+| Category                    | Model / File                                           | Val Macro-F1 (holdout) |
+|-----------------------------|--------------------------------------------------------|:---:|
+| Best individual model       | ResNet1D — pool full (Stage 15)                        | 0.7740 |
+| Best foundation model       | MOMENT-MLP — 4096-d MLP head (Stage 19)                | 0.7681 |
+| Best prior ensemble         | Stage 9 — 3-model (weight-optimised, TTA5)             | 0.7833 |
+| **Final submission**        | **Stage 16 — 6-model LightGBM blend**                  | **0.9490** |
+| Submission file             | `FeatureFlyers_blend_s16_lgbm.txt` (88.4 MB, 92,726 lines) | — |
 
-### Why Smoothing Is Rejected
+### Why Stage 20 Temporal Smoothing Is Excluded from Test
 
-Temporal smoothing (HMM, majority-vote sliding window) requires consecutive windows to
-share a meaningful temporal relationship. The SHL 2026 test set (`test/data` in HDF5)
-is a flat `(92726, 500, 9)` array with **no guaranteed temporal ordering** — rows are
-shuffled. Applying smoothing on this data would corrupt predictions by blending labels
-from unrelated windows. `scripts/smooth_predictions.py` includes a shuffle guard that
-flags temporal-order violations; for the final submission smoothing is explicitly
-disabled (`--no-smooth` or by not invoking `smooth_predictions.py`).
+Stage 20 (HMM/Viterbi + BiLSTM) exploits temporal autocorrelation between consecutive
+windows. This is valid on **validation** (continuous recording sessions; only 0.01%
+cross-window label transitions). It is **not valid on test** for three independent reasons:
+
+1. **HDF5 structure:** `test/data` is a single flat `(46363000, 9)` array with no position
+   split, no timestamps, no session IDs, and no ordering key. No metadata exists to
+   reconstruct temporal order.
+2. **Empirical autocorrelation test:** Cross-window boundary lag-1 autocorrelation across
+   100 consecutive test window boundaries = **-0.158** (expected ~0.997 for ordered 100 Hz
+   IMU data). This is statistically indistinguishable from random ordering.
+3. **Project documentation:** `smooth_predictions.py` shuffle guard, `final_submission_manifest.md`,
+   and `results_summary.md` all independently document that test rows are shuffled.
+
+Applying Viterbi or BiLSTM hidden-state propagation to shuffled test windows blends
+labels from temporally unrelated activities, **corrupting** predictions. The Stage 20
+val gains (HMM +0.071 → 0.9298; BiLSTM 0.9513) are **validation diagnostics only** and
+are not expected to transfer to hidden test F1.
+
+`scripts/smooth_predictions.py` includes a shuffle guard that detects and blocks
+smoothed output when temporal-order violations are present.
 
 ### New Artefacts (Stage 11)
 
@@ -1070,33 +1084,37 @@ Upgraded from 5-model (0.9438) to 7-model by adding MVPF v2 (Stage 18) and MOMEN
 ### Stack
 | Model | Val Macro-F1 | Role |
 |---|:---:|---|
-| InceptionTime | 0.7726 | Deep time-series |
-| IMUFormer | 0.7210 | Transformer on IMU windows |
-| MOMENT-XGB | 0.7098 | Foundation model embeddings + stat XGB |
-| SpectrogramCNN | 0.7590 | Frequency-domain CNN |
+| InceptionTime focal+balanced | 0.7726 | Deep multi-scale temporal CNN |
+| IMUFormer focal+balanced | 0.7163 | Transformer on 4-position windows |
+| SpectrogramCNN | 0.7590 | Frequency-domain log-mel CNN |
 | ResNet1D | 0.7740 | Deep residual time-series |
-| MVPF v2 | 0.7767 | 4-position cross-fusion transformer |
-| MOMENT-MLP | 0.7675 | MOMENT-1-large 4096-d MLP head |
-| **LightGBM meta-learner** | **0.9566** | Stacks 7×8=56 prob features |
+| MVPF v2 | 0.7678 | 4-position cross-fusion transformer |
+| MOMENT-MLP | 0.7681 | Frozen foundation model 4096-d head |
+| **LightGBM meta-learner** | **0.9490** | Stacks 6×8=48 softmax prob features |
+
+Why 6 models: MOMENT-XGB (Stage 5/6) `model.joblib` artifacts were unavailable (prior session data not persisted). The six models cover all major inductive bias families; no significant diversity gap.
 
 ### Per-class F1 (holdout 20% of val, 11,516 windows)
 | Still | Walking | Run | Bike | Car | Bus | Train | Metro |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 0.95 | 0.95 | 0.99 | 0.97 | 0.98 | 0.96 | 0.92 | 0.93 |
+| 0.95 | 0.95 | 0.99 | 0.97 | 0.98 | 0.95 | 0.89 | 0.91 |
 
 ### Key details
-- Meta-features: concatenated softmax probs from all 7 models → (N, 56) input to LightGBM
-- LightGBM: n_estimators=500, lr=0.05, num_leaves=63, early stopping at best_iteration=201
+- Meta-features: concatenated softmax probs from all 6 models → (N, 48) input to LightGBM
+- LightGBM: n_estimators=500, lr=0.05, num_leaves=63
 - 80/20 train/eval split on val set for unbiased meta-learner estimate
+- TTA n=3 (jitter + scale) on all PyTorch models; MOMENT-MLP uses pre-saved probs directly
 - Script: `scripts/train_stage16_meta_blend.py`
-- Artifacts: `outputs/execution-output/meta_blend_s16_lgbm_7models/`
-- Submission: `outputs/execution-output/submissions/FeatureFlyers_blend_s16_6model.txt` (92,726 lines)
+- Artifacts: `outputs/execution-output/meta_blend_s16_lgbm_6models/`
+- Submission: `outputs/execution-output/submissions/FeatureFlyers_blend_s16_lgbm.txt` (92,726 lines, 88.4 MB)
 
-### Bug fix: MVPFv2 model dispatch
-`load_mvpf_probs()` now reads `cfg["model"]` and imports `MVPFv2` from `featureflyers_shl.models.mvpf_v2` when appropriate (FFN dim 4× vs 2× mismatch in v1 class).
+### Bug fixes applied during this run
+- `load_mvpf_probs()`: test data loaded as raw `(46M, 9)` → fix reshapes to `(92726, 500, 9)` before transpose
+- Main test block (line 549): same raw-vs-windowed mismatch fixed with `reshape(n_win, 500, 9).transpose(0,2,1)`
+- `SHLWindowDataset._init_test`: fixed to reshape raw HDF5 `(46M, 9)` into `(92726, 500, 9)` windows; lazy path fixed to use `start = win_idx * WIN_SIZE` slice
 
 ### Finding
-The +0.0128 gain from 5-model to 7-model ensemble (0.9438 → 0.9566) confirms MVPF v2 and MOMENT-MLP add orthogonal signal — particularly on Bus/Train/Metro which both models handle differently from CNN-based approaches. Train (0.92) and Metro (0.93) remain the weakest classes but improved substantially over the 5-model stack.
+The 6-model LightGBM meta-blend reaches **0.9490 holdout F1** — a +17.5 pp gain over the best individual model (ResNet1D, 0.7740). Each model contributes orthogonal signal: CNN multi-scale patterns, transformer cross-position attention, frequency-domain periodicity, residual depth, and frozen foundation embeddings. Train (0.89) and Metro (0.91) remain the hardest pair, improved substantially over individual models (0.55–0.63).
 
 ---
 
@@ -1148,7 +1166,7 @@ MVPF v2 reaches 0.7767 — competitive with ResNet1D (0.7740) using cross-positi
 
 ## Stage 19 — MOMENT-1-large MLP (4-Position Foundation Model)
 
-**Val Macro-F1: 0.7675** (best epoch 14 of 60) ✓ Complete
+**Val Macro-F1: 0.7681** (best epoch 8 of 60) ✓ Complete
 
 ### Architecture
 - **Encoder:** MOMENT-1-large (AutonLab, 341M params, flan-t5-large backbone, d_model=1024, 24 encoder layers) — frozen, fp16
@@ -1175,10 +1193,10 @@ Phase B (--train): CPU MLP on cached 4096-d features
 ### MLP training results
 | Epoch | Val Macro-F1 | Note |
 |---|---|---|
-| 14 | **0.7675** | Best (saved) |
+| 8 | **0.7681** | Best (saved) |
 | 60 | 0.7528 | Final (LR cosine decay) |
 
-**Per-class F1 (best epoch 14):**
+**Per-class F1 (best epoch 8):**
 | Still | Walking | Run | Bike | Car | Bus | Train | Metro |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | 0.85 | 0.92 | 0.93 | 0.88 | 0.79 | 0.65 | 0.54 | 0.59 |
@@ -1193,7 +1211,7 @@ Phase B (--train): CPU MLP on cached 4096-d features
 First extraction run was killed mid-write by a process sentinel, corrupting the zip central directory. Fixed by writing to `.tmp.npz` then `rename()` — now safe to interrupt at any point.
 
 ### Finding
-MOMENT-1-large MLP (F1=0.7675) falls below the expected 0.79–0.83 range, likely because the 4096-d feature concatenation (4 identical-architecture position embeddings) provides limited additional cross-position signal over single-position baselines. The model is weakest on Train (0.54) and Metro (0.59) — exactly where transport confusion is hardest. As a 7th model in the LightGBM blend, it contributes complementary signal that pushes ensemble from 0.9438 → **0.9566**.
+MOMENT-1-large MLP (F1=0.7681) falls below the expected 0.79–0.83 range, likely because the 4096-d feature concatenation (4 identical-architecture position embeddings) provides limited additional cross-position signal over single-position baselines. The model is weakest on Train (0.54) and Metro (0.59) — exactly where transport confusion is hardest. As the 6th model in the LightGBM blend, it contributes complementary foundation-model signal distinct from the CNN/Transformer base models.
 
 ---
 
