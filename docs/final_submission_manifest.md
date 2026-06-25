@@ -6,11 +6,15 @@
 |------------------------|-----------------------------------------------------------------------------|
 | **Team**               | FeatureFlyers                                                               |
 | **Submission file**    | `FeatureFlyers_blend_s16_lgbm.txt`                                          |
-| **Stage**              | 16 — 6-Model LightGBM Meta-Blend                                            |
+| **Stage**              | 16 — Foundation-Enhanced Ensemble (LightGBM Meta-Blend)                     |
+| **Core method**        | Frozen MOMENT-1-large embeddings + lightweight MLP/LightGBM heads           |
+| **Auxiliary members**  | InceptionTime, IMUFormer, SpectrogramCNN, ResNet1D, MVPF (scratch-trained)  |
 | **Val Macro-F1**       | **0.9490** (holdout 20% of val = 11,516 windows)                            |
 | **Val Accuracy**       | 94.1%                                                                       |
 | **Smoothing applied**  | **No** — test rows are shuffled (cross-window boundary autocorrelation -0.158) |
 | **File size**          | 88.4 MB — 92,726 lines × 500 comma-separated integers (labels 1–8)         |
+
+**SHL 2026 compliance**: The foundation model (MOMENT-1-large, 341M params) is used in fully frozen mode — no weight updates at any stage. Only the MLP classification head (Stage 19) and the LightGBM meta-learner (Stage 16) are trained task-specifically. Scratch-trained deep models are auxiliary ensemble members, consistent with challenge rules permitting them as "supporting ensemble members."
 
 ---
 

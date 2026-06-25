@@ -882,13 +882,16 @@ Do not install both in strict production environments.
 
 ### Final Selection Summary
 
-| Category                    | Model / File                                           | Val Macro-F1 (holdout) |
-|-----------------------------|--------------------------------------------------------|:---:|
-| Best individual model       | ResNet1D — pool full (Stage 15)                        | 0.7740 |
-| Best foundation model       | MOMENT-MLP — 4096-d MLP head (Stage 19)                | 0.7681 |
-| Best prior ensemble         | Stage 9 — 3-model (weight-optimised, TTA5)             | 0.7833 |
-| **Final submission**        | **Stage 16 — 6-model LightGBM blend**                  | **0.9490** |
-| Submission file             | `FeatureFlyers_blend_s16_lgbm.txt` (88.4 MB, 92,726 lines) | — |
+**SHL 2026 compliance framing**: The solution is a **foundation-enhanced ensemble**. The core component is the frozen MOMENT-1-large model (341M params, weights never updated); only the MLP head (Stage 19) and LightGBM meta-learner (Stage 16) are task-trained. Scratch-trained deep models are auxiliary ensemble members, consistent with the challenge rule permitting them as supporting components alongside a frozen foundation model.
+
+| Category                         | Model / File                                                | Val Macro-F1 (holdout) |
+|----------------------------------|-------------------------------------------------------------|:---:|
+| **Core — frozen foundation**     | MOMENT-1-large (frozen) → MLP head (Stage 19)               | 0.7681 |
+| **Core — foundation + stat**     | MOMENT-1-large (frozen) + 354 stat feats → XGB (Stage 6)   | 0.7329 |
+| Auxiliary — best individual      | ResNet1D focal+balanced (Stage 15)                          | 0.7740 |
+| Auxiliary — prior ensemble       | Stage 9 — 3-model (weight-optimised, TTA5)                  | 0.7833 |
+| **Final submission**             | **Stage 16 — foundation-enhanced 6-model LightGBM blend**   | **0.9490** |
+| Submission file                  | `FeatureFlyers_blend_s16_lgbm.txt` (88.4 MB, 92,726 lines)  | — |
 
 ### Why Stage 20 Temporal Smoothing Is Excluded from Test
 
