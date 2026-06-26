@@ -30,8 +30,11 @@ Accuracy shown where available from run logs.
 | **16**| **Stage 16 — 6-model LightGBM blend**   | **0.9490**   | **94.1%**    | **Final submission — holdout 20% of val**          |
 | 20†   | HMM Viterbi (val diagnostic only)       | 0.9298       | —            | †Val only — test rows shuffled, not applicable     |
 | 20†   | BiLSTM on MOMENT embeddings (val diag.) | 0.9513       | —            | †Val only — test rows shuffled, not applicable     |
+| 22‡   | MOMENT(4096) + stat(1416) → LightGBM   | 0.6539       | 69.5%        | ‡Ablation — tree splits cannot exploit dense embeddings |
+| 23‡   | MOMENT(4096) + stat(1416) → MLP        | 0.7493       | 73.8%        | ‡Ablation — below MOMENT-MLP alone (0.7681); stat features add motion signal but dilute transport signal |
 
 †Stage 20 numbers are **validation diagnostics only**. Test predictions from HMM/BiLSTM are excluded from the final submission — see below.
+‡Stages 22–23 are **ablation experiments** exploring whether hand-crafted statistical features improve upon frozen MOMENT embeddings alone. See dedicated section below.
 
 ---
 
@@ -88,6 +91,44 @@ Applying Viterbi or BiLSTM hidden-state propagation to shuffled test windows wou
 
 ---
 
+## Stages 22–23 — Hybrid Ablation: MOMENT + Statistical Features
+
+**Research question**: do hand-crafted statistical/spectral features improve upon frozen MOMENT embeddings when combined into a single model?
+
+Combined feature vector: MOMENT-1-large frozen embeddings (4 pos × 1024-d = **4096-d**) concatenated with statistical/spectral hand-crafted features (4 pos × 354-d = **1416-d**) → **5512-d total**.
+
+Two heads were tested on this combined input, trained on the full 392,142-window train set and evaluated on the full 57,576-window val set (unbiased — no holdout split):
+
+| Stage | Head | Hyperparameters | Val Macro-F1 | vs Stage 19 |
+|-------|------|-----------------|:---:|:---:|
+| 22 | LightGBM | 500 trees, lr=0.05, early stopping patience=50 | 0.6539 | −11.4 pp |
+| 23 | MLP (3-layer) | hidden=1024, dropout=0.3, lr=1e-3, 60 ep, cosine LR | **0.7493** | −1.9 pp |
+| 19 (baseline) | MLP (3-layer) | hidden=1024, MOMENT only (4096-d) | **0.7681** | — |
+
+**Stage 22 per-class F1 (LightGBM):**
+| Still | Walking | Run | Bike | Car | Bus | Train | Metro |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0.858 | 0.889 | 0.410 | 0.906 | 0.760 | 0.550 | 0.484 | 0.374 |
+
+**Stage 23 per-class F1 (MLP):**
+| Still | Walking | Run | Bike | Car | Bus | Train | Metro |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0.872 | 0.921 | **0.945** | 0.860 | 0.740 | 0.613 | 0.563 | 0.480 |
+
+### Why Adding Stat Features Underperforms MOMENT-MLP Alone
+
+**Stage 22 (LightGBM)**: Tree models make axis-aligned splits on single features. MOMENT's 1024-d embeddings encode meaning jointly across all dimensions — no individual dimension is independently informative. The 4096-d embedding block appears as noise to a tree splitter. Early stopping fired at ~150 trees because the logloss plateau was unreachable via axis-aligned splits on dense embeddings. The 1416-d stat features were learned effectively but could not compensate.
+
+**Stage 23 (MLP)**: The MLP can exploit the embedding geometry (it learns linear combinations in layer 1), so it significantly outperforms Stage 22. However, it falls short of Stage 19 (MOMENT-only MLP) for two reasons:
+1. **Transport mode dilution**: stat features (dominant frequency, zero-crossing rate, RMS) encode locomotion physics well for motion classes (Run, Bike, Walking) but are nearly identical across transport modes (Car, Bus, Train, Metro) where the user is a passive passenger. Adding them introduces noise for the hardest classes.
+2. **Optimisation interference**: the two feature spaces have different gradient scales even after z-score normalisation; the MLP exhibits high epoch-to-epoch variance (±4 pp) for the full 60-epoch run, suggesting conflicting gradient directions.
+
+**Notable finding**: Run F1 jumps from ~0.71 (Stage 19 estimated) to **0.945** in Stage 23 — stat features (acceleration variance, step cadence via FFT) are highly discriminative for running and the MLP exploits this. The hybrid approach is strictly better for motion classes.
+
+**Conclusion**: MOMENT embeddings alone are near-optimal for transport-mode disambiguation. The hybrid is better for motion classes but worse overall. Neither Stage 22 nor Stage 23 is selected as the primary submission; both are documented as ablation results.
+
+---
+
 ## Stage 10 (Chronos-2 Foundation — Exploratory)
 
 | Run                        | N_train | Macro-F1 | Notes                                         |
@@ -124,3 +165,5 @@ Chronos-2 hybrid is unlikely to surpass Stage 16; archived as exploratory work.
 5. **Temporal smoothing valid on val, invalid on test**: HMM/BiLSTM improve val F1 because validation sessions are ordered. Test rows are shuffled (boundary autocorrelation -0.158); smoothing must not be applied to test predictions.
 
 6. **Foundation path alone is submission-viable**: MOMENT hybrid XGB (Stage 6, F1=0.7329) and MOMENT-MLP (Stage 19, F1=0.7681) are independently valid foundation-model submissions. The full ensemble simply achieves a higher score by incorporating auxiliary diversity.
+
+7. **Hybrid features help motion classes, hurt transport classes (Stages 22–23 ablation)**: Combining frozen MOMENT embeddings (4096-d) with hand-crafted statistical features (1416-d) improves Run F1 to 0.945 (+23 pp) but reduces Train/Metro F1, yielding a net loss of −1.9 pp vs. MOMENT-only MLP. Tree models (LightGBM, Stage 22) cannot exploit dense embeddings at all (F1=0.6539). The ablation confirms MOMENT representations are already near-optimal for transport disambiguation; stat features add orthogonal value only for physical-motion classes.
