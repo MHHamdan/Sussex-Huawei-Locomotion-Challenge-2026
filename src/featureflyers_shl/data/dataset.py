@@ -128,25 +128,32 @@ class SHLWindowDataset(Dataset):
             if "test" not in hf or "data" not in hf["test"]:
                 raise FileNotFoundError("HDF5 has no 'test/data' dataset.")
             ds = hf["test"]["data"]
-            total = ds.shape[0]
+            # HDF5 stores raw samples (N_raw, 9); reshape into non-overlapping windows.
+            total_samples = ds.shape[0]           # e.g. 46,363,000
+            n_windows = total_samples // WIN_SIZE  # e.g. 92,726
 
             if sample_limit is not None:
                 rng = np.random.default_rng(seed)
-                indices = rng.choice(total, size=min(sample_limit, total), replace=False)
-                indices = np.sort(indices)
+                win_indices = rng.choice(n_windows, size=min(sample_limit, n_windows), replace=False)
+                win_indices = np.sort(win_indices)
             else:
-                indices = np.arange(total, dtype=np.int64)
+                win_indices = np.arange(n_windows, dtype=np.int64)
 
             if preload:
-                self._X = ds[indices]           # (K, 500, 9) — direct slice
-                self._test_indices = indices
+                if sample_limit is None:
+                    raw = ds[:n_windows * WIN_SIZE]            # (N_raw, 9)
+                    self._X = raw.reshape(n_windows, WIN_SIZE, 9)  # (92726, 500, 9)
+                else:
+                    chunks = [ds[int(i) * WIN_SIZE : (int(i) + 1) * WIN_SIZE] for i in win_indices]
+                    self._X = np.stack(chunks)                 # (K, 500, 9)
+                self._test_indices = win_indices
             else:
                 self._X = None
-                self._test_indices = indices
+                self._test_indices = win_indices  # window indices (not raw-sample indices)
 
         self._labels = None
         self._win_starts = None
-        self._n = len(indices)
+        self._n = len(win_indices)
         self._is_test = True
         self._path_key = "test/data"
 
@@ -165,8 +172,9 @@ class SHLWindowDataset(Dataset):
             # Lazy HDF5 access
             hf = self._open_hf()
             if self._is_test:
-                raw_idx = int(self._test_indices[idx])
-                window = hf["test"]["data"][raw_idx]
+                win_idx = int(self._test_indices[idx])
+                start = win_idx * WIN_SIZE
+                window = hf["test"]["data"][start : start + WIN_SIZE]  # (500, 9)
             else:
                 start = int(self._win_starts[idx])
                 window = hf[self._path_key][start : start + WIN_SIZE]

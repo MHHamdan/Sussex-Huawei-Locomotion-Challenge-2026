@@ -244,7 +244,9 @@ def load_mvpf_probs(run_dir, split, hdf5_path, device, tta_n=3, jitter_std=0.02)
     if split == "test":
         # Only a single position available at test time — repeat it for all 4 slots
         with h5py.File(hdf5_path, "r") as hf:
-            single = hf["test"]["data"][:].astype(np.float32).transpose(0, 2, 1)  # (N, 9, 500)
+            raw_d = hf["test"]["data"][:].astype(np.float32)
+            n_w = raw_d.shape[0] // 500
+            single = raw_d[:n_w * 500].reshape(n_w, 500, 9).transpose(0, 2, 1)  # (92726, 9, 500)
         raw_multi = np.stack([single] * len(positions), axis=1)  # (N, 4, 9, 500)
         print(f"    test fallback: repeating single position ×{len(positions)}")
     else:
@@ -546,7 +548,9 @@ def main() -> None:
 
     print("\nLoading test windows …", flush=True)
     with __import__("h5py").File(HDF5_PATH, "r") as hf:
-        raw_test = hf["test"]["data"][:].astype(np.float32).transpose(0, 2, 1)
+        raw_data = hf["test"]["data"][:].astype(np.float32)  # (N_raw, 9)
+        n_win = raw_data.shape[0] // 500
+        raw_test = raw_data[:n_win * 500].reshape(n_win, 500, 9).transpose(0, 2, 1)  # (92726, 9, 500)
     N_test = len(raw_test)
     print(f"  {N_test:,} test windows\n")
 
